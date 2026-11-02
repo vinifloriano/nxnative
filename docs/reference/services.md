@@ -182,6 +182,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** cache storage: `OpenCacheStorageList` / `ReadCacheStorageList` report none, `CreateCacheStorage` / `MountCacheStorage` use a host folder beside the temporary storage. `fs::IsSaveDataExisting(ApplicationId, Uid)` for another title (it asks for Breath of the Wild's save: none) and `MountSaveDataReadOnly`.
 - **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) (1.4.3, the same `sdk` build as Breath of the Wild 1.9.0).
 
+### Rom of a program index, RAM disk and the default file data cache
+
+- **Symptom:** `[RED] sf: the game connects to service fsp-srv itself, which the host does not serve`, then `game called nn::diag abort: Result 0xe15, call site sdk+0xcfdd4` (`fs::detail::GetFileSystemProxyServiceObject`) under `fs::QueryMountRomCacheSize(size_t*, int)`, at the start of `nnMain`.
+- **Cause:** SDK 21 file system calls with no hook: the rom of a program index (`QueryMountRomCacheSize(size_t*, int)`, `MountRom(name, int, cache, size)`; the index selects a program of a multi-program application, fsp-srv's `OpenDataStorageWithProgramIndex`), a RAM disk (`GetRamDiskBufferSize`, `MountRamDisk`) and `EnableDefaultGlobalFileDataCache`.
+- **Fix:** program index 0 is the game's own RomFS, as `MountRom`; any other answers "target not found". A RAM disk is the host folder `<temporary storage>_ramdisk`, emptied when it is mounted (a RAM disk starts empty), and its buffer gets only the minimum size. The default file data cache is unused, as the global one (`hle_fs.c`).
+- **Found on:** [Factorio](../../dm/games/01004200189F4000/README.md) (2.0.77, SDK 21.4.2: rom index 0, a RAM disk `ramdisk:` of 32 MB).
+
 ### Device save data on the account save's directory
 
 - **Symptom:** the island lives in device save data, which the host did not mount.
@@ -709,6 +716,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Cause:** `clock_gettime(CLOCK_REALTIME)` calls through a source pointer (`sdk+0xb05010`) that `nntimeStartup` sets once `time::Initialize` succeeds: 1 = `nn::time::GetStandardUserSystemClockCurrentTimespec`, 2 = the adjustable clock's (`sdk+0x8e414`). Both asked the time service.
 - **Fix:** they are host take-overs now (`hle_time.c`), and `system_clock::now()` works on any build.
 - **Found on:** [Ace Attorney Investigations Collection](../../dm/games/010005501E68C000/README.md) (1.0.0.2, SDK 17.5.3).
+
+### `clock_gettime(CLOCK_MONOTONIC)` through the steady clock
+
+- **Symptom:** `std::terminate` (`Break` from `std::get_terminate`, `sdk+0x66324c`) at the game's first `std::chrono::steady_clock::now()` (`main+0x1c412e8`), right after its mounts.
+- **Cause:** SDK 21's `nntimeStartup` points the C library's monotonic clock too at a time-service getter (`sdk+0x9e464`, selector 3: `nn::time::GetStandardSteadyClockCurrentTimespec`; the system tick before that), and `steady_clock::now()` throws on its failure.
+- **Fix:** the getter is a host take-over that reads the guest clock, as the system tick does: it stops in the background and follows `DM_DETCLOCK` (`hle_time.c`).
+- **Found on:** [Factorio](../../dm/games/01004200189F4000/README.md) (2.0.77, SDK 21.4.2).
 
 ### Guest clock reads wait while the app is in the background
 

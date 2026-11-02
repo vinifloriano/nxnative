@@ -66,6 +66,18 @@ int main(void) {
     CHECK(read_fs("rom:\\data\\over", got, sizeof got) && !strcmp(got, "only-overlay") && read_fs("rom:\\data\\base", got, sizeof got) && !strcmp(got, "only-base"), "backslashes separate as slashes do, in both layers");
     CHECK(h_fs_OpenFile(&rh, "rom:/data/base", MODE_READ) == RES_OK && rh && !(rh & 15), "a folder file's handle is 16-byte aligned, as a Horizon FileAccessor pointer is (%#llx)", (unsigned long long)rh); h_fs_CloseFile(rh);
     g_nmnt = 0;
+    // SDK 21: rom of a program index (0 = the game's own RomFS, another index is not there) and a RAM disk (a host folder beside the temporary storage, empty at every mount)
+    size_t rsz = 0;
+    CHECK(h_fs_QueryRomCacheIdx(&rsz, 0) == RES_OK && rsz > 0 && h_fs_MountRomIdx("rom", 0, NULL, rsz) == RES_OK, "rom of program index 0 mounts the RomFS");
+    CHECK(read_fs("rom:/data/base", got, sizeof got) && !strcmp(got, "only-base"), "and reads it");
+    CHECK(h_fs_QueryRomCacheIdx(&rsz, 1) == RES_TARGET_NOT_FOUND && h_fs_MountRomIdx("rom1", 1, NULL, 0) == RES_TARGET_NOT_FOUND, "program index 1: target not found");
+    char tmp[1100], rd[1200]; snprintf(tmp, sizeof tmp, "%s/temp", root); snprintf(rd, sizeof rd, "%s_ramdisk", tmp); setenv("DM_TEMP", tmp, 1);
+    CHECK(h_fs_RamDiskBufSize(32 << 20) > 0, "a RAM disk buffer size");
+    CHECK(h_fs_MountRamDisk("ramdisk", NULL, 0) == RES_OK && h_fs_CreateFile("ramdisk:/x", 0) == RES_OK && write_save("ramdisk:/x", "ram") == RES_OK, "mount the RAM disk and write a file");
+    snprintf(p, sizeof p, "%s/x", rd); CHECK(same(p, "ram"), "the file is in %s", rd);
+    g_nmnt = 0;
+    CHECK(h_fs_MountRamDisk("ramdisk", NULL, 0) == RES_OK && access(p, F_OK) != 0, "mounted again (a new process): empty");
+    g_nmnt = 0;
     unsetenv("DM_ROMFS_OVERLAY");
     {   // game files that are neither a folder nor a file (a stale path, a fifo) stop the rom mount with a FATAL line, in a child so the abort does not end this test
         char gone[1200], fifo[1200], out[1200]; snprintf(gone, sizeof gone, "%s/RomFS", root); snprintf(fifo, sizeof fifo, "%s/fifo", root); snprintf(out, sizeof out, "%s/fatal.txt", root);

@@ -18,7 +18,8 @@
 #   a:<name>=<slot>:<type>                       a vertex input, [[attribute(slot)]]
 #   u:<name>=<offset>:<type>:<count>:<stride>    a member of the default uniform block (count 0 = not an array)
 #   b:<slot>:<size>                              the default uniform block: its buffer slot and size in bytes
-#   t:<name>=<slot>:<type>                       a combined sampler: texture and sampler slot
+#   B:<name>=<slot>:<size>                       a named uniform block (std140), read from the buffer the game binds to it: its buffer slot and size in bytes
+#   t:<name>=<slot>:<type>                       a combined sampler: texture and sampler slot (a samplerBuffer is a Metal texture buffer, texture slot only)
 #   o:<name>=<location>                          a fragment output, [[color(location)]]
 # <TAB> where it came from
 # Usage: gl_shaders.py <input path>... <out dir> [--ios <dir>]   (input paths: the RomFS, the main NSO, capture folders)
@@ -145,7 +146,7 @@ def translate(src, stage, key, tmp):
     r = subprocess.run(['glslangValidator', '-V', '-R', '--aml', '--amb', '-S', stage, g, '-o', spv], capture_output=True, text=True)
     if r.returncode: return 'glslang: ' + ' | '.join(l for l in (r.stdout + r.stderr).splitlines() if 'ERROR' in l and 'compilation' not in l)[:400]
     refl = json.loads(subprocess.run([SPIRV_CROSS, spv, '--reflect'], capture_output=True, text=True, check=True).stdout)
-    cmd = [SPIRV_CROSS, spv, '--msl', '--msl-version', '20300', '--msl-decoration-binding', '--rename-entry-point', 'main', f'gl_{key}_{stage[0]}', stage, '--output', msl]
+    cmd = [SPIRV_CROSS, spv, '--msl', '--msl-version', '20300', '--msl-decoration-binding', '--msl-texture-buffer-native', '--rename-entry-point', 'main', f'gl_{key}_{stage[0]}', stage, '--output', msl]
     if stage == 'vert': cmd.append('--fixup-clipspace')
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode: return 'spirv-cross: ' + r.stderr.strip()[:300]
@@ -163,7 +164,9 @@ def translate(src, stage, key, tmp):
     bools = {n for n in re.findall(r'\buniform\s+(?:(?:lowp|mediump|highp)\s+)?bool\s+(\w+)\s*;', pre)}
     for u in refl.get('ubos', []):
         t = refl['types'][u['type']]
-        if t['name'] != 'gl_DefaultUniformBlock': return f'uniform block {t["name"]} is not the default block'
+        if t['name'] != 'gl_DefaultUniformBlock':   # a named block (std140): the game fills a buffer and binds it (glUniformBlockBinding, glBindBufferBase / Range)
+            if u.get('array'): return f'uniform block array {t["name"]}'
+            f.append(f'B:{t["name"]}={u["binding"]}:{u["block_size"]}'); continue
         f.append(f'b:{u["binding"]}:{u["block_size"]}')
         e = uni_members(refl, t['members'], '', 0, f, bools)
         if e: return e
@@ -218,7 +221,7 @@ def main():
         for key, where, errs in failed:
             if not any(k == key for k, _ in seen): print(f'[RED] {where} ({key}) does not translate: {" / ".join(errs)}')
         tsv = ['# GL shaders (dm/gfx/tools/gl_shaders.py): key = sha256(GLSL source)[:16], Metal function gl_<key>_v / gl_<key>_f; a: vertex inputs, u: default uniform block members '
-               '(offset:type:count:stride), b: the block (slot:size), t: combined samplers (slot:type), o: fragment outputs',
+               '(offset:type:count:stride), b: the block (slot:size), B: named blocks (name=slot:size), t: combined samplers (slot:type), o: fragment outputs',
                '# ' + ' '.join(subprocess.run(['glslangValidator', '--version'], capture_output=True, text=True).stdout.split()[:3]) + '; spirv-cross '
                + ' '.join((lambda r: r.stdout + r.stderr)(subprocess.run([SPIRV_CROSS, '--revision'], capture_output=True, text=True)).split())]
         tsv += [f'{k[0]}\t{v[0]}\t{" ".join(v[1])}\t{v[3]}' for k, v in sorted(seen.items())]

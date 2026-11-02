@@ -4,6 +4,7 @@
 #include <mach-o/getsect.h>
 
 uint64_t guest_ns(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC); }
+void guest_clock_read_wait(void) {}
 static int checks, fails;
 extern const struct mach_header_64 _mh_execute_header;
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s\n", msg); } } while (0)
@@ -22,7 +23,12 @@ int main(void) {
     Result (*adj_snap)(uint8_t *) = hook("_ZN2nn4time13ClockSnapshot31CreateWithAdjustableSystemClockEPS1_");
     unsigned (*span)(int64_t *, const uint8_t *, const uint8_t *) = hook("_ZN2nn4time20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_");
     int64_t (*udiff)(const uint8_t *, const uint8_t *) = hook("_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13ClockSnapshotES3_");
-    if (!snap || !adj_snap || !span || !udiff) { printf("time: %d checks, %d failed\n", checks, fails); return 1; }
+    int (*steady)(int64_t *) = hook("_ZN2nn4time37GetStandardSteadyClockCurrentTimespecEP8timespec");   // SDK 21's clock_gettime(CLOCK_MONOTONIC)
+    if (!snap || !adj_snap || !span || !udiff || !steady) { printf("time: %d checks, %d failed\n", checks, fails); return 1; }
+    int64_t t0[2] = {-1, -1}, t1[2] = {-1, -1}; uint64_t g0 = guest_ns();
+    CHECK(steady(t0) == 0 && t0[1] >= 0 && t0[1] < 1000000000LL, "steady timespec: success, nanoseconds below a second");
+    CHECK(steady(t1) == 0 && t1[0] * 1000000000LL + t1[1] >= t0[0] * 1000000000LL + t0[1], "steady timespec does not go back");
+    CHECK((uint64_t)(t0[0] * 1000000000LL + t0[1]) >= g0 && (uint64_t)(t0[0] * 1000000000LL + t0[1]) - g0 < 1000000000ull, "steady timespec is the guest clock");
     uint8_t a[0xd0], b[0xd0], c[0xd0]; int64_t ts = -1;
     // Before the first snapshot: h_time_GetCurrentTime reads DM_FIXED_TIME once and caches it
     setenv("DM_FIXED_TIME", "1700000000", 1);

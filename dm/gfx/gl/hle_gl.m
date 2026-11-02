@@ -2,6 +2,7 @@
 // driver, subsdk0, which the host does not load; Balatro: LÖVE 11.4 on SDL, the same driver). main imports the EGL functions, which bind to the ones here through the host's import
 // table (hle.h swhle). GL functions use that same table for direct imports and eglGetProcAddress (a glad loader asks for 2,956 names; Digimon's code calls 79 of them,
 // LÖVE's about 150, counted with dm/tools/loader_census.py). Only those are implemented; every other loader name gets a null pointer (DM_GL_STUBS=1: a stub that reports its first call).
+// Factorio (its own engine on SDL, GL 3.3 core) needs named uniform blocks, sampler objects, buffer textures, several draw buffers, integer formats, image copies and readback.
 // LÖVE takes the core profile's paths (GL_CONTEXT_PROFILE_MASK): its vertex streams are persistently mapped buffers (glBufferStorage, glMapBufferRange) that fences
 // (glFenceSync / glClientWaitSync) keep the CPU from rewriting while a frame reads them; with a compatibility profile it would draw from client memory, which Metal cannot.
 // Model:
@@ -115,6 +116,8 @@ enum {
     GL_RENDERBUFFER_WIDTH = 0x8d42, GL_RENDERBUFFER_HEIGHT, GL_RENDERBUFFER_INTERNAL_FORMAT, GL_FRAMEBUFFER_SRGB = 0x8db9, GL_SAMPLER_2D_ARRAY = 0x8dc1,
     GL_UNSIGNED_INT_VEC2 = 0x8dc6, GL_UNSIGNED_INT_VEC3, GL_UNSIGNED_INT_VEC4, GL_TEXTURE_SWIZZLE_R = 0x8e42, GL_TEXTURE_SWIZZLE_A = 0x8e45,
     GL_ALREADY_SIGNALED = 0x911a, GL_TIMEOUT_EXPIRED, GL_CONDITION_SATISFIED, GL_CONTEXT_PROFILE_MASK = 0x9126,
+    GL_UNIFORM_BUFFER = 0x8a11, GL_TEXTURE_BUFFER = 0x8c2a, GL_COPY_READ_BUFFER = 0x8f36, GL_COPY_WRITE_BUFFER, GL_PIXEL_PACK_BUFFER = 0x88eb, GL_PIXEL_UNPACK_BUFFER,
+    GL_NONE = 0,
 };
 #define GL_MAP_INVALIDATE_BUFFER_BIT 0x8
 #define GL_SYNC_FLUSH_COMMANDS_BIT 0x1
@@ -130,7 +133,8 @@ static void *zalloc(size_t n) { void *p = calloc(1, n); if (!p) die("[gl] out of
 static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_q;
 static id<MTLSharedEvent> g_ev;                  // signalled with a command buffer's serial at its end
-static id<MTLTexture> g_tex0, g_cube0, g_tex3d0, g_arr0;   // bound where a sampler's unit has no texture (or an unusable one): opaque black, as GL samples an incomplete texture
+static id<MTLTexture> g_tex0, g_cube0, g_tex3d0, g_arr0, g_utex0, g_tbuf0;   // bound where a sampler's unit has no texture (or an unusable one): opaque black, as GL samples an incomplete texture
+                                                                            // (g_utex0: an unsigned integer one; g_tbuf0: a texture buffer of one texel)
 static id<MTLSamplerState> g_samp0;
 static id<MTLLibrary> g_lib, g_util;             // the game's shaders; the layer's own (clears)
 static uint64_t g_serial = 1;                    // serial of the command buffer being recorded (g_cb); committed ones have lower serials
@@ -142,12 +146,12 @@ static _Atomic uint64_t g_sk_prog, g_sk_pass, g_sk_attr, g_sk_pso;   // draws dr
 
 // ---------- Shader table (<DM_MSL_DIR>/gl/gl_shaders.tsv) ----------
 enum { T_FLOAT, T_VEC2, T_VEC3, T_VEC4, T_INT, T_IVEC2, T_IVEC3, T_IVEC4, T_UINT, T_UVEC2, T_UVEC3, T_UVEC4, T_BOOL, T_MAT2, T_MAT3, T_MAT4,
-       T_SAMP2D, T_SAMPCUBE, T_SAMP3D, T_SAMP2DARR, T_SAMP2DSH, T_OTHER };
+       T_SAMP2D, T_SAMPCUBE, T_SAMP3D, T_SAMP2DARR, T_SAMP2DSH, T_USAMP2D, T_SAMPBUF, T_OTHER };
 static const char *const g_tnames[] = {"float", "vec2", "vec3", "vec4", "int", "ivec2", "ivec3", "ivec4", "uint", "uvec2", "uvec3", "uvec4", "bool", "mat2", "mat3", "mat4",
-                                       "sampler2D", "samplerCube", "sampler3D", "sampler2DArray", "sampler2DShadow"};
+                                       "sampler2D", "samplerCube", "sampler3D", "sampler2DArray", "sampler2DShadow", "usampler2D", "samplerBuffer"};
 static const GLenum g_tenums[] = {GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4, GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4, GL_UNSIGNED_INT, GL_UNSIGNED_INT_VEC2,
                                   GL_UNSIGNED_INT_VEC3, GL_UNSIGNED_INT_VEC4, GL_BOOL, GL_FLOAT_MAT2, GL_FLOAT_MAT3, GL_FLOAT_MAT4, GL_SAMPLER_2D, GL_SAMPLER_CUBE, GL_SAMPLER_3D,
-                                  GL_SAMPLER_2D_ARRAY, GL_SAMPLER_2D_SHADOW, GL_FLOAT};   // glGetActiveUniform's types
+                                  GL_SAMPLER_2D_ARRAY, GL_SAMPLER_2D_SHADOW, 0x8dd2 /* UNSIGNED_INT_SAMPLER_2D */, 0x8dc2 /* SAMPLER_BUFFER */, GL_FLOAT};   // glGetActiveUniform's types
 static int tcode(const char *s) { for (int i = 0; i < T_OTHER; i++) if (!strcmp(s, g_tnames[i])) return i; return T_OTHER; }
 static int tcomps(int t) { static const int c[] = {1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 4, 9, 16}; return t < T_SAMP2D ? c[t] : 1; }
 static int is_samp(int t) { return t >= T_SAMP2D && t < T_OTHER; }
@@ -155,7 +159,8 @@ static int is_intt(int t) { return t >= T_INT && t <= T_BOOL; }
 typedef struct { char name[48]; uint8_t slot, type; } shattr;                         // a vertex input
 typedef struct { char name[48]; uint16_t off, count, stride; uint8_t type; } shuni;   // a default block member (count 0 = not an array)
 typedef struct { char name[48]; uint8_t slot, type; } shsamp;                         // a combined sampler: texture and sampler slot
-typedef struct { char key[17]; int frag, ub_slot, ub_size, na, nu, nt; shattr *a; shuni *u; shsamp *t; } shinfo;
+typedef struct { char name[48]; uint8_t slot; uint32_t size; } shblk;                 // a named uniform block: its buffer slot and size
+typedef struct { char key[17]; int frag, ub_slot, ub_size, na, nu, nt, nb; shattr *a; shuni *u; shsamp *t; shblk *b; } shinfo;
 static shinfo *g_sh; static int g_nsh;
 static int sh_cmp(const void *a, const void *b) { int c = memcmp(((const shinfo *)a)->key, ((const shinfo *)b)->key, 16); return c ? c : ((const shinfo *)a)->frag - ((const shinfo *)b)->frag; }
 static void sh_load(void) {
@@ -172,9 +177,9 @@ static void sh_load(void) {
         if (g_nsh == cap) { cap = cap ? cap * 2 : 1024; g_sh = realloc(g_sh, cap * sizeof *g_sh); }
         shinfo *s = &g_sh[g_nsh++]; memset(s, 0, sizeof *s);
         memcpy(s->key, key, 16); s->frag = !strcmp(stage, "frag"); s->ub_slot = -1;
-        int na = 0, nu = 0, nt = 0;
-        for (char *c = res; c && *c; c++) if (c == res || c[-1] == ' ') { na += *c == 'a'; nu += *c == 'u'; nt += *c == 't'; }
-        s->a = zalloc((na + 1) * sizeof *s->a); s->u = zalloc((nu + 1) * sizeof *s->u); s->t = zalloc((nt + 1) * sizeof *s->t);
+        int na = 0, nu = 0, nt = 0, nb = 0;
+        for (char *c = res; c && *c; c++) if (c == res || c[-1] == ' ') { na += *c == 'a'; nu += *c == 'u'; nt += *c == 't'; nb += *c == 'B'; }
+        s->a = zalloc((na + 1) * sizeof *s->a); s->u = zalloc((nu + 1) * sizeof *s->u); s->t = zalloc((nt + 1) * sizeof *s->t); s->b = zalloc((nb + 1) * sizeof *s->b);
         for (char *t = res ? strtok(res, " ") : NULL; t; t = strtok(NULL, " ")) {
             char nm[64], ty[32]; unsigned a1, a2, a3;
             if (t[0] == 'a' && sscanf(t, "a:%63[^=]=%u:%31s", nm, &a1, ty) == 3 && a1 < 16) { shattr *x = &s->a[s->na++]; strlcpy(x->name, nm, sizeof x->name); x->slot = a1; x->type = tcode(ty); }
@@ -182,8 +187,10 @@ static void sh_load(void) {
                 shuni *x = &s->u[s->nu++]; strlcpy(x->name, nm, sizeof x->name); x->off = a1; x->type = tcode(ty); x->count = a2; x->stride = a3;
             } else if (t[0] == 't' && sscanf(t, "t:%63[^=]=%u:%31s", nm, &a1, ty) == 3) { shsamp *x = &s->t[s->nt++]; strlcpy(x->name, nm, sizeof x->name); x->slot = a1; x->type = tcode(ty); }
             else if (t[0] == 'b' && sscanf(t, "b:%u:%u", &a1, &a2) == 2) { s->ub_slot = a1; s->ub_size = a2; }
+            else if (t[0] == 'B' && sscanf(t, "B:%63[^=]=%u:%u", nm, &a1, &a2) == 3) { shblk *x = &s->b[s->nb++]; strlcpy(x->name, nm, sizeof x->name); x->slot = a1; x->size = a2; }
         }
         if (s->ub_slot >= 15) GLOG("[RED] shader %s: uniform block at buffer slot %d meets the vertex buffer slots", s->key, s->ub_slot);
+        for (int i = 0; i < s->nb; i++) if (s->b[i].slot >= 15) GLOG("[RED] shader %s: uniform block %s at buffer slot %d meets the vertex buffer slots", s->key, s->b[i].name, s->b[i].slot);
     }
     fclose(f);
     qsort(g_sh, g_nsh, sizeof *g_sh, sh_cmp);
@@ -193,7 +200,6 @@ static void sh_load(void) {
     if (!g_lib) GLOG("[RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String);
 }
 static const shinfo *sh_find(const char *key, int frag) { shinfo k; memcpy(k.key, key, 16); k.frag = frag; return g_nsh ? bsearch(&k, g_sh, g_nsh, sizeof *g_sh, sh_cmp) : NULL; }
-
 
 static void dev_init_once(void) {
     @autoreleasepool {
@@ -213,6 +219,14 @@ static void dev_init_once(void) {
         [g_tex3d0 replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:&black bytesPerRow:4 bytesPerImage:4];
         td.textureType = MTLTextureType2DArray; g_arr0 = [g_dev newTextureWithDescriptor:td];
         [g_arr0 replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:0 withBytes:&black bytesPerRow:4 bytesPerImage:0];
+        const uint32_t ublack[4] = {0, 0, 0, 1};
+        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Uint width:1 height:1 mipmapped:NO];
+        g_utex0 = [g_dev newTextureWithDescriptor:td];
+        [g_utex0 replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:ublack bytesPerRow:16];
+        id<MTLBuffer> tb = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        const float fblack[4] = {0, 0, 0, 1}; memcpy(tb.contents, fblack, 16);
+        g_tbuf0 = [tb newTextureWithDescriptor:[MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:1 resourceOptions:MTLResourceStorageModeShared
+                                                                                                      usage:MTLTextureUsageShaderRead] offset:0 bytesPerRow:256];
         g_samp0 = [g_dev newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
         NSError *err = nil;
         g_util = host_msl_lib(g_dev, nil, "gl_util", &err);   // dm/gfx/msl/gl_util.metal: a quad that clears what a scissored or masked glClear covers (a render pass can only clear its attachments whole)
@@ -300,16 +314,22 @@ typedef struct {
     level_t pend[6][MAXLV]; int defined;   // defined: bit per level whose face(s) were given
     __strong id<MTLTexture> tex; __strong id<MTLSamplerState> smp;
     GLint minf, magf, ws, wt, wr, maxlv, cmp, swz[4]; float aniso, border[4]; int smp_dirty;
+    GLuint tb_buf; size_t tb_off, tb_size; __strong id<MTLBuffer> tb_src;   // a buffer texture (glTexBuffer): its buffer and range, and the MTLBuffer tex views
 } tex_t;
 NAMES(tex_t, g_texs, g_ntexs, g_captexs)
 static tex_t *tex_of(GLuint n) { return n && n < g_ntexs ? g_texs[n] : NULL; }
+// Sampler objects (glGenSamplers): the sampler parameters of a texture, kept in a tex_t that holds no image; one bound to a unit replaces its texture's own parameters
+NAMES(tex_t, g_smps, g_nsmps, g_capsmps)
+static tex_t *smp_of(GLuint n) { return n && n < g_nsmps ? g_smps[n] : NULL; }
 
 typedef struct { int fmt; uint32_t w, h; __strong id<MTLTexture> tex; uint64_t gen; } rb_t;
 NAMES(rb_t, g_rbs, g_nrbs, g_caprbs)
 static rb_t *rb_of(GLuint n) { return n && n < g_nrbs ? g_rbs[n] : NULL; }
 
 typedef struct { int kind; GLuint name; int level, face; } att_t;   // kind 0 none, 1 texture, 2 renderbuffer; face: a cube face, an array layer or a 3D slice
-typedef struct { att_t col, depth, stencil; uint64_t gen; } fb_t;
+// col: GL_COLOR_ATTACHMENT0..7; draw[i]: the colour attachment fragment output i writes (glDrawBuffers; -1 = GL_NONE), which is Metal's colour attachment i of the pass
+#define NCOL 8
+typedef struct { att_t col[NCOL], depth, stencil; int8_t draw[NCOL]; int draw_set, read; uint64_t gen; } fb_t;   // read: the attachment glReadBuffer names
 NAMES(fb_t, g_fbs, g_nfbs, g_capfbs)
 static fb_t *fb_of(GLuint n) { return n && n < g_nfbs ? g_fbs[n] : NULL; }
 
@@ -320,14 +340,16 @@ static vao_t g_vao0;   // the default vertex array (GL core has none, the compat
 
 typedef struct { GLenum type; char *src; size_t len; char key[17]; const shinfo *si; __strong id<MTLFunction> fn; int compiled; } shader_t;
 typedef struct { char name[48]; uint8_t type; uint16_t count; int32_t off[2]; uint16_t stride[2]; int slot[2]; int unit; } puni_t;   // [0] vertex, [1] fragment
-typedef struct { uint32_t vf[16]; uint16_t stride[16]; uint8_t div[16]; uint32_t cpf, dpf, spf; uint8_t blend, mask, bsrc, bdst, bsa, bda, eqc, eqa; } pkey_t;
+typedef struct { uint32_t vf[16]; uint16_t stride[16]; uint8_t div[16]; uint32_t cpf[NCOL], dpf, spf; uint8_t blend, mask[NCOL], bsrc, bdst, bsa, bda, eqc, eqa; } pkey_t;
 typedef struct { pkey_t k; void *pso; } pent_t;   // pso: a retained id<MTLRenderPipelineState>, NULL = failed
 // amap: the game's attribute index of each Metal vertex input (glBindAttribLocation before the link, else the input's own number, which glGetAttribLocation returns);
 // LÖVE binds VertexPosition, VertexTexCoord, VertexColor and ConstantColor to 0–3 in every program
 typedef struct { char name[48]; int index; } abind_t;
+typedef struct { char name[48]; uint32_t size; int slot[2]; GLuint binding; } pblk_t;   // a named uniform block of both stages, merged by name: its slot per stage, glUniformBlockBinding's index
 typedef struct {
     GLuint vs, fs; int linked; const shinfo *si[2]; __strong id<MTLFunction> fn[2];
     int nu; puni_t *u; uint8_t *ub[2]; uint64_t ub_gen[2]; uint32_t serial;
+    int nb; pblk_t *b;
     pent_t *pc; int npc, cappc;
     abind_t bind[16]; int nbind; int8_t amap[16];
 } prog_t;
@@ -341,11 +363,14 @@ static prog_t *prog_of(GLuint n) { return n && n < g_nsps && g_sps[n] && g_sps[n
 // units: as many as GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS says (LÖVE binds a texture of each type to every one at start); fb / read_fb: the draw and read framebuffers;
 // va: each attribute's current value (glVertexAttrib4f), what a vertex input reads when its array is disabled: LÖVE's VertexColor and ConstantColor
 #define NUNITS 96
+#define NUBO 16
 static struct {
     GLuint array_buf, rb, fb, read_fb, prog, vao; int unit;
-    struct { GLuint t2d, tcube, t3d, t2da; } units[NUNITS];
+    GLuint ubo_buf, tex_buf, copy_rd, copy_wr, pack_buf, unpack_buf;   // the generic bindings of the other buffer targets
+    struct { GLuint buf; size_t off, size; } ubo[NUBO];                 // the indexed uniform buffer bindings (glBindBufferBase / Range); size 0 = the whole buffer
+    struct { GLuint t2d, tcube, t3d, t2da, tbuf, smp; } units[NUNITS];
     float clear_c[4]; double clear_d; int clear_s;
-    uint8_t cmask, dmask, depth, blend, cull, scissor, stencil, poffset, srgb;
+    uint8_t cmaski[NCOL], dmask, depth, blend, cull, scissor, stencil, poffset, srgb;   // cmaski: each draw buffer's colour mask (glColorMask sets all, glColorMaski one)
     GLenum dfunc, cull_face, front, bsrc, bdst, bsa, bda, eqc, eqa;
     GLenum sfunc, sfail, szfail, spass; GLint sref; GLuint smask, swmask;
     GLint vp[4], sc[4]; float pfactor, punits, psize;
@@ -353,7 +378,7 @@ static struct {
     int unpack_align, unpack_row, pack_align;
     uint32_t palette[256]; int npalette, color_table, index_shift, index_offset;
     int swap_interval;
-} S = {.cmask = 0xf, .dmask = 1, .dfunc = 0x201, .cull_face = GL_BACK, .front = GL_CCW, .bsrc = 1, .bdst = 0, .bsa = 1, .bda = 0, .eqc = GL_FUNC_ADD, .eqa = GL_FUNC_ADD,
+} S = {.cmaski = {0xf, 0xf, 0xf, 0xf, 0xf, 0xf, 0xf, 0xf}, .dmask = 1, .dfunc = 0x201, .cull_face = GL_BACK, .front = GL_CCW, .bsrc = 1, .bdst = 0, .bsa = 1, .bda = 0, .eqc = GL_FUNC_ADD, .eqa = GL_FUNC_ADD,
        .sfunc = 0x207, .sfail = GL_KEEP, .szfail = GL_KEEP, .spass = GL_KEEP, .smask = 0xffffffff, .swmask = 0xffffffff, .clear_d = 1, .unpack_align = 4, .pack_align = 4,
        .swap_interval = 1, .psize = 1,
        .va = {{0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1},
@@ -364,7 +389,7 @@ static GLuint *unit_slot(int unit, GLenum target) {   // a unit's binding of a t
     if (unit < 0 || unit >= NUNITS) return NULL;
     switch (target) {
         case GL_TEXTURE_2D: return &S.units[unit].t2d; case GL_TEXTURE_CUBE_MAP: return &S.units[unit].tcube;
-        case GL_TEXTURE_3D: return &S.units[unit].t3d; case GL_TEXTURE_2D_ARRAY: return &S.units[unit].t2da;
+        case GL_TEXTURE_3D: return &S.units[unit].t3d; case GL_TEXTURE_2D_ARRAY: return &S.units[unit].t2da; case GL_TEXTURE_BUFFER: return &S.units[unit].tbuf;
     }
     return NULL;
 }
@@ -398,7 +423,7 @@ typedef struct { MTLPixelFormat pf; uint8_t bytes, bw, bh, kind; MTLTextureSwizz
 #define SW0 SWZ(Red, Green, Blue, Alpha)
 enum { F_RGBA8, F_BGRA8, F_SRGBA8, F_R8, F_RG8, F_L8, F_A8, F_LA8, F_RGBA16F, F_RGBA32F, F_R16F, F_RG16F, F_R32F, F_RG32F, F_RG11B10F, F_RGB10A2, F_RGBA16,
        F_D16, F_D32F, F_D32FS8, F_S8, F_BC1_RGB, F_BC1, F_BC2, F_BC3, F_BC1_SRGB, F_BC2_SRGB, F_BC3_SRGB, F_BC4, F_BC4S, F_BC5, F_BC5S, F_BC7, F_BC7_SRGB, F_BC6S, F_BC6U,
-       F_ASTC4, F_ASTC4_SRGB, F_N };
+       F_ASTC4, F_ASTC4_SRGB, F_R8UI, F_RG8UI, F_RGBA8UI, F_R16UI, F_RG16UI, F_RGBA16UI, F_R32UI, F_RG32UI, F_RGBA32UI, F_N };
 static const fmt_t g_fmt[F_N] = {
     [F_RGBA8] = {MTLPixelFormatRGBA8Unorm, 4, 1, 1, K_COL, SW0, "RGBA8"}, [F_BGRA8] = {MTLPixelFormatBGRA8Unorm, 4, 1, 1, K_COL, SW0, "BGRA8"},
     [F_SRGBA8] = {MTLPixelFormatRGBA8Unorm_sRGB, 4, 1, 1, K_COL, SW0, "SRGB8_ALPHA8"},
@@ -422,7 +447,15 @@ static const fmt_t g_fmt[F_N] = {
     [F_BC6S] = {MTLPixelFormatBC6H_RGBFloat, 16, 4, 4, K_BLOCK, SW0, "BPTC signed float"},
     [F_BC6U] = {MTLPixelFormatBC6H_RGBUfloat, 16, 4, 4, K_BLOCK, SW0, "BPTC unsigned float"},
     [F_ASTC4] = {MTLPixelFormatASTC_4x4_LDR, 16, 4, 4, K_BLOCK, SW0, "ASTC 4x4"}, [F_ASTC4_SRGB] = {MTLPixelFormatASTC_4x4_sRGB, 16, 4, 4, K_BLOCK, SW0, "ASTC 4x4 sRGB"},
+    [F_R8UI] = {MTLPixelFormatR8Uint, 1, 1, 1, K_COL, SW0, "R8UI"}, [F_RG8UI] = {MTLPixelFormatRG8Uint, 2, 1, 1, K_COL, SW0, "RG8UI"},
+    [F_RGBA8UI] = {MTLPixelFormatRGBA8Uint, 4, 1, 1, K_COL, SW0, "RGBA8UI"}, [F_R16UI] = {MTLPixelFormatR16Uint, 2, 1, 1, K_COL, SW0, "R16UI"},
+    [F_RG16UI] = {MTLPixelFormatRG16Uint, 4, 1, 1, K_COL, SW0, "RG16UI"}, [F_RGBA16UI] = {MTLPixelFormatRGBA16Uint, 8, 1, 1, K_COL, SW0, "RGBA16UI"},
+    [F_R32UI] = {MTLPixelFormatR32Uint, 4, 1, 1, K_COL, SW0, "R32UI"}, [F_RG32UI] = {MTLPixelFormatRG32Uint, 8, 1, 1, K_COL, SW0, "RG32UI"},
+    [F_RGBA32UI] = {MTLPixelFormatRGBA32Uint, 16, 1, 1, K_COL, SW0, "RGBA32UI"},
 };
+static int fmt_is_int(int f) { return f >= F_R8UI && f <= F_RGBA32UI; }
+static int fmt_of_pf(MTLPixelFormat pf) { for (int f = 0; f < F_N; f++) if (g_fmt[f].pf == pf) return f; return -1; }
+static int pf_is_int(MTLPixelFormat pf) { for (int f = F_R8UI; f <= F_RGBA32UI; f++) if (g_fmt[f].pf == pf) return 1; return 0; }
 // internal format (+ format / type for unsized ones) → fmt and the conversion of the given data; -1 when not mapped
 static int fmt_pick(GLint ifmt, GLenum format, GLenum type, int *cv) {
     *cv = CV_COPY;
@@ -480,6 +513,9 @@ static int fmt_pick(GLint ifmt, GLenum format, GLenum type, int *cv) {
         case GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT: return F_BC6U;
         case GL_COMPRESSED_RGBA_ASTC_4x4: return F_ASTC4;
         case GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4: return F_ASTC4_SRGB;
+        // unsigned integer formats (Factorio's map and 5:6:5 sprite textures, its RG32UI / RGBA32UI render targets): the data as given
+        case 0x8232: return F_R8UI; case 0x8238: return F_RG8UI; case 0x8d7c: return F_RGBA8UI; case 0x8234: return F_R16UI; case 0x823a: return F_RG16UI;
+        case 0x8d76: return F_RGBA16UI; case 0x8236: return F_R32UI; case 0x823c: return F_RG32UI; case 0x8d70: return F_RGBA32UI;
     }
     return -1;
 }
@@ -494,7 +530,8 @@ static void *pixels_convert(const void *src, uint32_t w, uint32_t h, GLenum form
     if (g_fmt[f].kind == K_BLOCK) { memcpy(dst, src, dp * rows); return dst; }   // compressed data has no unpack rows
     static const int comps_of[] = {[GL_RED - GL_RED] = 1, [GL_GREEN - GL_RED] = 1, [GL_BLUE - GL_RED] = 1, [GL_ALPHA - GL_RED] = 1, [GL_RGB - GL_RED] = 3, [GL_RGBA - GL_RED] = 4,
                                    [GL_LUMINANCE - GL_RED] = 1, [GL_LUMINANCE_ALPHA - GL_RED] = 2};
-    int comps = format == GL_BGRA ? 4 : format == GL_RG ? 2 : format == GL_COLOR_INDEX || format == GL_DEPTH_COMPONENT ? 1 :
+    int comps = format == GL_BGRA || format == 0x8d99 /* RGBA_INTEGER */ ? 4 : format == GL_RG || format == 0x8228 /* RG_INTEGER */ ? 2 :
+                format == GL_COLOR_INDEX || format == GL_DEPTH_COMPONENT || format == 0x8d94 /* RED_INTEGER */ ? 1 : format == 0x8d98 /* RGB_INTEGER */ ? 3 :
                 format >= GL_RED && format <= GL_LUMINANCE_ALPHA ? comps_of[format - GL_RED] : 4;
     int tbytes = type == GL_FLOAT || type == GL_UNSIGNED_INT || type == GL_INT ? 4 : type == GL_HALF_FLOAT || type == GL_UNSIGNED_SHORT || type == GL_SHORT ? 2 : 1;
     if (cv == CV_565 || cv == CV_4444 || cv == CV_5551) { comps = 1; tbytes = 2; }
@@ -643,8 +680,9 @@ static void tex_image(GLenum target, GLint level, int f, int cv, uint32_t w, uin
 
 // ---------- Render passes ----------
 // The pass being encoded: framebuffer name, its attachments' generation (a changed attachment ends the pass), clears waiting for the pass to begin
-static struct { GLuint fb; uint64_t gen; int open; uint32_t w, h; MTLPixelFormat cpf, dpf, spf; } P;
-static struct { int bits; float c[4]; double d; int s; GLuint fb; } g_pend_clear;
+// cpf[i]: the pixel format of the pass's colour attachment i (draw buffer i); cbits / cc: the colour attachments a pending clear covers and the value of each
+static struct { GLuint fb; uint64_t gen; int open; uint32_t w, h; MTLPixelFormat cpf[NCOL], dpf, spf; } P;
+static struct { int bits, cbits; double cc[NCOL][4]; double d; int s; GLuint fb; } g_pend_clear;
 static struct { void *pso; void *dss; int cull, wind, vp[4], sc[4], sref; float pf, pu; GLuint prog; uint64_t ub_gen[2]; } E;   // encoder state set so far (NULL / -1 = unset)
 
 static id<MTLTexture> att_tex(const att_t *a, uint64_t *gen) {
@@ -652,13 +690,24 @@ static id<MTLTexture> att_tex(const att_t *a, uint64_t *gen) {
     if (a->kind == 2) { rb_t *r = rb_of(a->name); if (!r) return nil; *gen += r->gen; return r->tex; }
     return nil;
 }
-static uint64_t fb_gen(GLuint fb) { fb_t *f = fb_of(fb); if (!f) return 0; uint64_t g = f->gen; att_tex(&f->col, &g); att_tex(&f->depth, &g); att_tex(&f->stencil, &g); return g; }
+static uint64_t fb_gen(GLuint fb) {
+    fb_t *f = fb_of(fb); if (!f) return 0;
+    uint64_t g = f->gen; for (int i = 0; i < NCOL; i++) att_tex(&f->col[i], &g);
+    att_tex(&f->depth, &g); att_tex(&f->stencil, &g); return g;
+}
+// The colour attachment draw buffer i writes, NULL for none: GL's default draw buffers are attachment 0 alone (the window: its one image)
+static const att_t *fb_draw_att(const fb_t *f, int i) {
+    int a = f->draw_set ? f->draw[i] : i == 0 ? 0 : -1;
+    return a >= 0 && a < NCOL && f->col[a].kind ? &f->col[a] : NULL;
+}
 // The size of a framebuffer (its first attachment's level), 0 when it has none
 static void fb_size(GLuint fb, uint32_t *w, uint32_t *h) {
     *w = *h = 0;
     if (!fb) { *w = g_win.w; *h = g_win.h; return; }
     fb_t *f = fb_of(fb); if (!f) return;
-    const att_t *a = f->col.kind ? &f->col : f->depth.kind ? &f->depth : &f->stencil; uint64_t g = 0;
+    const att_t *a = &f->stencil; for (int i = NCOL - 1; i >= 0; i--) if (f->col[i].kind) a = &f->col[i];
+    if (a == &f->stencil && f->depth.kind) a = &f->depth;
+    uint64_t g = 0;
     id<MTLTexture> t = att_tex(a, &g); if (t) { *w = umax(1, (uint32_t)t.width >> a->level); *h = umax(1, (uint32_t)t.height >> a->level); }
 }
 static void pass_end(void) {
@@ -670,16 +719,18 @@ static void pass_begin(void) {
     @autoreleasepool {
         id<MTLCommandBuffer> cb = cb_get();
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        id<MTLTexture> c = nil, d = nil, s = nil; int cl = 0, cs = 0, dl = 0, sl = 0;
+        id<MTLTexture> c[NCOL] = {nil}, d = nil, s = nil; int cl[NCOL] = {0}, cs[NCOL] = {0}, dl = 0, sl = 0;
         uint64_t gen = 0;
         if (!S.fb) {
             if (!g_win.made) { int w, h; dm_vi_layer_size(&w, &h); win_make(w > 0 ? w : 1280, h > 0 ? h : 720); }
-            c = g_win.col[g_win.cur]; d = s = g_win.ds;
+            c[0] = g_win.col[g_win.cur]; d = s = g_win.ds;
         } else {
             fb_t *f = fb_of(S.fb);
             if (f) {
-                c = att_tex(&f->col, &gen); d = att_tex(&f->depth, &gen); s = att_tex(&f->stencil, &gen);
-                cl = f->col.level; cs = f->col.face; dl = f->depth.level; sl = f->stencil.level;
+                for (int i = 0; i < NCOL; i++) att_tex(&f->col[i], &gen);   // every attachment counts for the generation, drawn into or not
+                for (int i = 0; i < NCOL; i++) { const att_t *a = fb_draw_att(f, i); uint64_t g = 0; if (a) { c[i] = att_tex(a, &g); cl[i] = a->level; cs[i] = a->face; } }
+                d = att_tex(&f->depth, &gen); s = att_tex(&f->stencil, &gen);
+                dl = f->depth.level; sl = f->stencil.level;
                 gen += f->gen;
             }
             if (d && d.pixelFormat != MTLPixelFormatDepth32Float && d.pixelFormat != MTLPixelFormatDepth16Unorm && d.pixelFormat != MTLPixelFormatDepth32Float_Stencil8) d = nil;
@@ -688,11 +739,15 @@ static void pass_begin(void) {
             if (d && !s && d.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) { s = d; sl = dl; }
             else if (s && !d && s.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) { d = s; dl = sl; }
         }
-        int pc = g_pend_clear.fb == S.fb ? g_pend_clear.bits : 0;
-        if (c) {
-            MTLRenderPassColorAttachmentDescriptor *a = rp.colorAttachments[0]; a.texture = c; a.level = cl; a.storeAction = MTLStoreActionStore;
-            if (c.textureType == MTLTextureType3D) a.depthPlane = cs; else a.slice = cs;
-            if (pc & GL_COLOR_BUFFER_BIT) { a.loadAction = MTLLoadActionClear; a.clearColor = MTLClearColorMake(g_pend_clear.c[0], g_pend_clear.c[1], g_pend_clear.c[2], g_pend_clear.c[3]); }
+        int pc = g_pend_clear.fb == S.fb ? g_pend_clear.bits : 0, pcc = g_pend_clear.fb == S.fb ? g_pend_clear.cbits : 0;
+        id<MTLTexture> any = nil; int lv = 0;
+        for (int i = 0; i < NCOL; i++) {
+            P.cpf[i] = c[i] ? c[i].pixelFormat : MTLPixelFormatInvalid;
+            if (!c[i]) continue;
+            if (!any) { any = c[i]; lv = cl[i]; }
+            MTLRenderPassColorAttachmentDescriptor *a = rp.colorAttachments[i]; a.texture = c[i]; a.level = cl[i]; a.storeAction = MTLStoreActionStore;
+            if (c[i].textureType == MTLTextureType3D) a.depthPlane = cs[i]; else a.slice = cs[i];
+            if (pcc >> i & 1) { a.loadAction = MTLLoadActionClear; a.clearColor = MTLClearColorMake(g_pend_clear.cc[i][0], g_pend_clear.cc[i][1], g_pend_clear.cc[i][2], g_pend_clear.cc[i][3]); }
             else a.loadAction = MTLLoadActionLoad;
         }
         if (d) {
@@ -705,12 +760,12 @@ static void pass_begin(void) {
             if (pc & GL_STENCIL_BUFFER_BIT) { rp.stencilAttachment.loadAction = MTLLoadActionClear; rp.stencilAttachment.clearStencil = g_pend_clear.s; }
             else rp.stencilAttachment.loadAction = MTLLoadActionLoad;
         }
-        if (g_pend_clear.fb == S.fb) g_pend_clear.bits = 0;
-        if (!c && !d && !s) { RED1("framebuffer %u has no usable attachment", S.fb); return; }
-        id<MTLTexture> any = c ? c : d ? d : s; int lv = c ? cl : d ? dl : sl;
+        if (g_pend_clear.fb == S.fb) g_pend_clear.bits = g_pend_clear.cbits = 0;
+        if (!any && !d && !s) { RED1("framebuffer %u has no usable attachment", S.fb); return; }
+        if (!any) { any = d ? d : s; lv = d ? dl : sl; }
         P.w = umax(1, (uint32_t)any.width >> lv); P.h = umax(1, (uint32_t)any.height >> lv);
-        if (!c) { rp.renderTargetWidth = P.w; rp.renderTargetHeight = P.h; }
-        P.cpf = c ? c.pixelFormat : MTLPixelFormatInvalid; P.dpf = d ? d.pixelFormat : MTLPixelFormatInvalid; P.spf = s ? s.pixelFormat : MTLPixelFormatInvalid;
+        if (!c[0]) { rp.renderTargetWidth = P.w; rp.renderTargetHeight = P.h; }
+        P.dpf = d ? d.pixelFormat : MTLPixelFormatInvalid; P.spf = s ? s.pixelFormat : MTLPixelFormatInvalid;
         g_enc = [cb renderCommandEncoderWithDescriptor:rp];
         P.fb = S.fb; P.gen = gen; P.open = 1; g_n_pass++;
         enc_reset();
@@ -724,7 +779,7 @@ static int pass_ensure(void) {
 }
 // Clears no draw followed: a pass that only clears
 static void clears_flush(void) {
-    if (g_pend_clear.bits) { GLuint keep = S.fb; S.fb = g_pend_clear.fb; pass_end(); pass_begin(); pass_end(); S.fb = keep; g_pend_clear.bits = 0; }
+    if (g_pend_clear.bits) { GLuint keep = S.fb; S.fb = g_pend_clear.fb; pass_end(); pass_begin(); pass_end(); S.fb = keep; g_pend_clear.bits = g_pend_clear.cbits = 0; }
 }
 
 // ---------- Pipelines ----------
@@ -795,11 +850,13 @@ static id<MTLRenderPipelineState> pso_get(prog_t *p, const pkey_t *k) {
             }
         }
         pd.vertexDescriptor = vd;
-        MTLRenderPipelineColorAttachmentDescriptor *ca = pd.colorAttachments[0];
-        ca.pixelFormat = (MTLPixelFormat)k->cpf;
-        if (k->cpf) {
-            ca.writeMask = (k->mask & 1 ? MTLColorWriteMaskRed : 0) | (k->mask & 2 ? MTLColorWriteMaskGreen : 0) | (k->mask & 4 ? MTLColorWriteMaskBlue : 0) | (k->mask & 8 ? MTLColorWriteMaskAlpha : 0);
-            if (k->blend) {
+        for (int i = 0; i < NCOL; i++) {
+            MTLRenderPipelineColorAttachmentDescriptor *ca = pd.colorAttachments[i];
+            ca.pixelFormat = (MTLPixelFormat)k->cpf[i];
+            if (!k->cpf[i]) continue;
+            int m = k->mask[i];
+            ca.writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) | (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
+            if (k->blend && !pf_is_int((MTLPixelFormat)k->cpf[i])) {   // GL does not blend into an integer attachment; Metal refuses blending there
                 ca.blendingEnabled = YES;
                 ca.sourceRGBBlendFactor = bf_of(bdecode(k->bsrc)); ca.destinationRGBBlendFactor = bf_of(bdecode(k->bdst));
                 ca.sourceAlphaBlendFactor = bf_of(bdecode(k->bsa)); ca.destinationAlphaBlendFactor = bf_of(bdecode(k->bda));
@@ -867,6 +924,8 @@ static void enc_state(void) {
     id<MTLDepthStencilState> ds = dss_get();
     if ((__bridge void *)ds != E.dss) { E.dss = (__bridge void *)ds; [e setDepthStencilState:ds]; }
 }
+static id<MTLTexture> tex_buffer_view(tex_t *t);
+static id<MTLSamplerState> smp_state(tex_t *s, const tex_t *t);
 static void bind_uniforms_textures(prog_t *p) {
     id<MTLRenderCommandEncoder> e = g_enc;
     for (int st = 0; st < 2; st++) {
@@ -881,15 +940,36 @@ static void bind_uniforms_textures(prog_t *p) {
             E.ub_gen[st] = p->ub_gen[st];
         }
     }
+    // named uniform blocks: the range bound to the block's binding (glBindBufferBase / Range), read where the GPU finds it when the draw runs (glBufferSubData into a buffer
+    // in flight copies it first, so each draw keeps the contents it was given)
+    for (int i = 0; i < p->nb; i++) {
+        pblk_t *k = &p->b[i];
+        buf_t *b = k->binding < NUBO ? buf_of(S.ubo[k->binding].buf) : NULL;
+        if (!b || !b->mb) { RED1("uniform block %s: no buffer bound to its binding %u, the draw reads zeros", k->name, k->binding); }
+        size_t off = b && b->mb ? S.ubo[k->binding].off : 0;
+        if (b && b->mb && off + k->size > b->mb.length) { RED1("uniform block %s (%u bytes) is larger than the buffer range bound to it", k->name, k->size); }
+        for (int st = 0; st < 2; st++) {
+            if (k->slot[st] < 0) continue;
+            if (b && b->mb && off + k->size <= b->mb.length) {
+                b->use = g_serial;
+                if (st) [e setFragmentBuffer:b->mb offset:off atIndex:k->slot[st]]; else [e setVertexBuffer:b->mb offset:off atIndex:k->slot[st]];
+            } else {
+                size_t zo; id<MTLBuffer> z = arena_alloc(k->size, &zo); memset((uint8_t *)z.contents + zo, 0, k->size);
+                if (st) [e setFragmentBuffer:z offset:zo atIndex:k->slot[st]]; else [e setVertexBuffer:z offset:zo atIndex:k->slot[st]];
+            }
+        }
+    }
     for (int i = 0; i < p->nu; i++) {
         puni_t *u = &p->u[i];
         if (!is_samp(u->type)) continue;
         int unit = u->unit < 0 || u->unit >= NUNITS ? 0 : u->unit;
-        GLenum target = u->type == T_SAMPCUBE ? GL_TEXTURE_CUBE_MAP : u->type == T_SAMP3D ? GL_TEXTURE_3D : u->type == T_SAMP2DARR ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
-        tex_t *t = tex_of(*unit_slot(unit, target));
+        GLenum target = u->type == T_SAMPCUBE ? GL_TEXTURE_CUBE_MAP : u->type == T_SAMP3D ? GL_TEXTURE_3D : u->type == T_SAMP2DARR ? GL_TEXTURE_2D_ARRAY :
+                        u->type == T_SAMPBUF ? GL_TEXTURE_BUFFER : GL_TEXTURE_2D;
+        tex_t *t = tex_of(*unit_slot(unit, target)), *so = smp_of(S.units[unit].smp);
         id<MTLTexture> tx = nil; id<MTLSamplerState> sm = g_samp0;
-        if (t && (t->made || tex_make(t, 0)) && t->tex) { tx = t->tex; sm = tex_sampler(t); t->use = g_serial; }
-        if (!tx) tx = u->type == T_SAMPCUBE ? g_cube0 : u->type == T_SAMP3D ? g_tex3d0 : u->type == T_SAMP2DARR ? g_arr0 : g_tex0;
+        if (u->type == T_SAMPBUF) { if (t && (tx = tex_buffer_view(t))) buf_of(t->tb_buf)->use = g_serial; }
+        else if (t && (t->made || tex_make(t, 0)) && t->tex && (u->type == T_USAMP2D) == fmt_is_int(t->fmt)) { tx = t->tex; sm = so ? smp_state(so, t) : tex_sampler(t); t->use = g_serial; }
+        if (!tx) tx = u->type == T_SAMPCUBE ? g_cube0 : u->type == T_SAMP3D ? g_tex3d0 : u->type == T_SAMP2DARR ? g_arr0 : u->type == T_USAMP2D ? g_utex0 : u->type == T_SAMPBUF ? g_tbuf0 : g_tex0;
         static int dl = -1; if (dl < 0) dl = getenv("DM_GL_DRAWLOG") != NULL;
         if (dl && tx == g_tex0 && t == NULL) {   // a sampler with no texture: the layer draws the 1x1 black placeholder
             static uint32_t seen_p[64]; static int seen_u[64], nseen;
@@ -951,8 +1031,9 @@ static int draw_setup(void) {
             cbuf[s] = mb; coff[s] = off;   // bound below
         }
     }
-    k.cpf = P.cpf; k.dpf = P.dpf; k.spf = P.spf; k.mask = S.cmask;
-    if (S.blend && P.cpf) { k.blend = 1; k.bsrc = bcode(S.bsrc); k.bdst = bcode(S.bdst); k.bsa = bcode(S.bsa); k.bda = bcode(S.bda); k.eqc = beq_of(S.eqc); k.eqa = beq_of(S.eqa); }
+    int anyc = 0; for (int i = 0; i < NCOL; i++) { k.cpf[i] = (uint32_t)P.cpf[i]; k.mask[i] = S.cmaski[i]; anyc |= P.cpf[i] != MTLPixelFormatInvalid; }
+    k.dpf = P.dpf; k.spf = P.spf;
+    if (S.blend && anyc) { k.blend = 1; k.bsrc = bcode(S.bsrc); k.bdst = bcode(S.bdst); k.bsa = bcode(S.bsa); k.bda = bcode(S.bda); k.eqc = beq_of(S.eqc); k.eqa = beq_of(S.eqa); }
     id<MTLRenderPipelineState> pso = pso_get(p, &k);
     if (!pso) { g_sk_pso++; return 0; }
     id<MTLRenderCommandEncoder> e = g_enc;
@@ -974,7 +1055,7 @@ static int draw_setup(void) {
           const shinfo *vsi = p->si[0];
           fb_t *fbt = fb_of(S.fb);
           GLOG("draw %ld: framebuffer %u (colour tex %u) target %ux%u viewport %d,%d %dx%d scissor %d,%d %dx%d program %u blend %d mode %#x %s %d x%d",
-               (long)n, S.fb, fbt ? fbt->col.name : 0, t ? (unsigned)t.width : 0, t ? (unsigned)t.height : 0, S.vp[0], S.vp[1], S.vp[2], S.vp[3], S.sc[0], S.sc[1], S.sc[2], S.sc[3],
+               (long)n, S.fb, fbt ? fbt->col[0].name : 0, t ? (unsigned)t.width : 0, t ? (unsigned)t.height : 0, S.vp[0], S.vp[1], S.vp[2], S.vp[3], S.sc[0], S.sc[1], S.sc[2], S.sc[3],
                S.prog, S.blend, (unsigned)g_dl_mode, g_dl_elems ? "indexed" : "array", g_dl_n, g_dl_inst);
           { static uint32_t dumped[32]; static int ndumped; int seen = 0; for (int k = 0; k < ndumped; k++) if (dumped[k] == p->serial) seen = 1;
             if (!seen && ndumped < 32) { dumped[ndumped++] = p->serial;
@@ -1074,27 +1155,33 @@ GLB(glClear, void, GLbitfield mask) {
         uint32_t fw, fh; fb_size(S.fb, &fw, &fh);
         int full = !S.scissor || (S.sc[0] <= 0 && S.sc[1] <= 0 && S.sc[0] + S.sc[2] >= (int)fw && S.sc[1] + S.sc[3] >= (int)fh);
         int bits = mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-        if ((bits & GL_COLOR_BUFFER_BIT) && S.cmask != 0xf) full = 0;
+        if (bits & GL_COLOR_BUFFER_BIT) for (int i = 0; i < NCOL; i++) if (S.cmaski[i] != 0xf) full = 0;
         if ((bits & GL_DEPTH_BUFFER_BIT) && !S.dmask) bits &= ~GL_DEPTH_BUFFER_BIT;
         if ((bits & GL_STENCIL_BUFFER_BIT) && (S.swmask & 0xff) != 0xff) full = 0;
         if (!bits) return;
         if (full) {
             if (g_pend_clear.bits && g_pend_clear.fb != S.fb) clears_flush();
             if (P.open) pass_end();   // a new pass for the draws after it
-            g_pend_clear.fb = S.fb; g_pend_clear.bits |= bits; memcpy(g_pend_clear.c, S.clear_c, sizeof S.clear_c); g_pend_clear.d = S.clear_d; g_pend_clear.s = S.clear_s;
+            g_pend_clear.fb = S.fb; g_pend_clear.bits |= bits; g_pend_clear.d = S.clear_d; g_pend_clear.s = S.clear_s;
+            if (bits & GL_COLOR_BUFFER_BIT) { g_pend_clear.cbits = (1 << NCOL) - 1; for (int i = 0; i < NCOL; i++) for (int c = 0; c < 4; c++) g_pend_clear.cc[i][c] = S.clear_c[c]; }
             return;
         }
         if (!pass_ensure()) return;
-        static __strong id<MTLRenderPipelineState> cache[16]; static uint64_t ck[16]; static int nc;
-        uint64_t key = (uint64_t)P.cpf | (uint64_t)P.dpf << 16 | (uint64_t)P.spf << 32 | (uint64_t)((bits & GL_COLOR_BUFFER_BIT) ? S.cmask : 0) << 48;
+        // the quad writes draw buffer 0 (clr_fs has one output); the pass's other attachments are in the pipeline, masked
+        if (bits & GL_COLOR_BUFFER_BIT) for (int i = 1; i < NCOL; i++) if (P.cpf[i]) { RED1("a scissored or masked glClear of several draw buffers clears draw buffer 0 only"); break; }
+        typedef struct { uint32_t cpf[NCOL], dpf, spf, m; } ckey_t;
+        static __strong id<MTLRenderPipelineState> cache[16]; static ckey_t ck[16]; static int nc;
+        ckey_t key; memset(&key, 0, sizeof key);
+        for (int i = 0; i < NCOL; i++) key.cpf[i] = (uint32_t)P.cpf[i];
+        key.dpf = (uint32_t)P.dpf; key.spf = (uint32_t)P.spf; key.m = (bits & GL_COLOR_BUFFER_BIT) ? S.cmaski[0] : 0;
         id<MTLRenderPipelineState> pso = nil;
-        for (int i = 0; i < nc; i++) if (ck[i] == key) pso = cache[i];
+        for (int i = 0; i < nc; i++) if (!memcmp(&ck[i], &key, sizeof key)) pso = cache[i];
         if (!pso && g_util) {
             MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
             pd.vertexFunction = [g_util newFunctionWithName:@"clr_vs"];
-            pd.fragmentFunction = [g_util newFunctionWithName:P.cpf ? @"clr_fs" : @"clr_fs_none"];
-            pd.colorAttachments[0].pixelFormat = P.cpf;
-            int m = (bits & GL_COLOR_BUFFER_BIT) ? S.cmask : 0;
+            pd.fragmentFunction = [g_util newFunctionWithName:!P.cpf[0] ? @"clr_fs_none" : pf_is_int(P.cpf[0]) ? @"clr_fs_u" : @"clr_fs"];   // an integer attachment: the values as integers
+            for (int i = 0; i < NCOL; i++) { pd.colorAttachments[i].pixelFormat = P.cpf[i]; pd.colorAttachments[i].writeMask = MTLColorWriteMaskNone; }
+            int m = key.m;
             pd.colorAttachments[0].writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) | (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
             pd.depthAttachmentPixelFormat = P.dpf; pd.stencilAttachmentPixelFormat = P.spf;
             NSError *err = nil; pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
@@ -1132,11 +1219,39 @@ GL(glClearStencil, void, GLint s) { S.clear_s = s; }
 // The depth range is [0,1] unless a game narrows it; the layer's viewport always maps the whole range (GameMaker's runner sets 0..1)
 GL(glDepthRange, void, GLdouble n, GLdouble f) { if (n != 0 || f != 1) RED1("glDepthRange(%g, %g): only 0..1 is mapped", (double)n, (double)f); }
 GL(glDepthRangef, void, GLfloat n, GLfloat f) { if (n != 0 || f != 1) RED1("glDepthRangef(%g, %g): only 0..1 is mapped", (double)n, (double)f); }
-// One buffer cleared to a value of its own, the clear values left as they were (LÖVE clears a canvas so when it is given a colour per canvas); colour attachment 0 only
+// One buffer cleared to a value of its own, the clear values left as they were (LÖVE clears a canvas so when it is given a colour per canvas). A colour draw buffer cleared whole
+// (no scissor, nothing masked) is its attachment's load action in the next pass, as glClear's; any other is draw buffer 0's quad. v: four floats, or the integer values as doubles
+static void clear_color_buffer(GLint i, const double *v) {
+    if (i < 0 || i >= NCOL) return;
+    uint32_t fw, fh; fb_size(S.fb, &fw, &fh);
+    int full = (!S.scissor || (S.sc[0] <= 0 && S.sc[1] <= 0 && S.sc[0] + S.sc[2] >= (int)fw && S.sc[1] + S.sc[3] >= (int)fh)) && S.cmaski[i] == 0xf;
+    if (!full && i == 0) {
+        float keep[4]; memcpy(keep, S.clear_c, sizeof keep); for (int c = 0; c < 4; c++) S.clear_c[c] = (float)v[c];
+        h_glClear(GL_COLOR_BUFFER_BIT); memcpy(S.clear_c, keep, sizeof keep); return;
+    }
+    if (!full) { RED1("a scissored or masked glClearBuffer of draw buffer %d: cleared whole", i); }
+    if (g_pend_clear.bits && g_pend_clear.fb != S.fb) clears_flush();
+    if (P.open) pass_end();
+    g_pend_clear.fb = S.fb; g_pend_clear.bits |= GL_COLOR_BUFFER_BIT; g_pend_clear.cbits |= 1 << i; memcpy(g_pend_clear.cc[i], v, sizeof g_pend_clear.cc[i]);
+}
 GLB(glClearBufferfv, void, GLenum buffer, GLint drawbuffer, const GLfloat *v) {
-    if (buffer == GL_COLOR && drawbuffer == 0) { float keep[4]; memcpy(keep, S.clear_c, sizeof keep); memcpy(S.clear_c, v, sizeof keep); h_glClear(GL_COLOR_BUFFER_BIT); memcpy(S.clear_c, keep, sizeof keep); }
+    if (buffer == GL_COLOR) { const double d[4] = {v[0], v[1], v[2], v[3]}; clear_color_buffer(drawbuffer, d); }
     else if (buffer == GL_DEPTH) { double keep = S.clear_d; S.clear_d = v[0] < 0 ? 0 : v[0] > 1 ? 1 : v[0]; h_glClear(GL_DEPTH_BUFFER_BIT); S.clear_d = keep; }
     else RED1("glClearBufferfv(%#x, %d) not implemented", buffer, drawbuffer);
+}
+GLB(glClearBufferuiv, void, GLenum buffer, GLint drawbuffer, const GLuint *v) {
+    if (buffer == GL_COLOR) { const double d[4] = {v[0], v[1], v[2], v[3]}; clear_color_buffer(drawbuffer, d); }
+    else RED1("glClearBufferuiv(%#x, %d) not implemented", buffer, drawbuffer);
+}
+GLB(glClearBufferiv, void, GLenum buffer, GLint drawbuffer, const GLint *v) {
+    if (buffer == GL_COLOR) { const double d[4] = {v[0], v[1], v[2], v[3]}; clear_color_buffer(drawbuffer, d); }
+    else if (buffer == GL_STENCIL) { int keep = S.clear_s; S.clear_s = v[0]; h_glClear(GL_STENCIL_BUFFER_BIT); S.clear_s = keep; }
+    else RED1("glClearBufferiv(%#x, %d) not implemented", buffer, drawbuffer);
+}
+GLB(glClearBufferfi, void, GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
+    (void)buffer; (void)drawbuffer;
+    double kd = S.clear_d; int ks = S.clear_s; S.clear_d = depth < 0 ? 0 : depth > 1 ? 1 : depth; S.clear_s = stencil;
+    h_glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT); S.clear_d = kd; S.clear_s = ks;
 }
 
 // ---------- State ----------
@@ -1159,7 +1274,11 @@ static void cap_set(GLenum cap, int on) {
 }
 GL(glEnable, void, GLenum cap) { cap_set(cap, 1); }
 GL(glDisable, void, GLenum cap) { cap_set(cap, 0); }
-GL(glColorMask, void, uint32_t r, uint32_t g, uint32_t b, uint32_t a) { S.cmask = (r & 0xff ? 1 : 0) | (g & 0xff ? 2 : 0) | (b & 0xff ? 4 : 0) | (a & 0xff ? 8 : 0); }
+GL(glColorMask, void, uint32_t r, uint32_t g, uint32_t b, uint32_t a) { memset(S.cmaski, (r & 0xff ? 1 : 0) | (g & 0xff ? 2 : 0) | (b & 0xff ? 4 : 0) | (a & 0xff ? 8 : 0), sizeof S.cmaski); }
+GL(glColorMaski, void, GLuint i, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+    if (i >= NCOL) return;
+    S.cmaski[i] = (r & 0xff ? 1 : 0) | (g & 0xff ? 2 : 0) | (b & 0xff ? 4 : 0) | (a & 0xff ? 8 : 0);
+}
 GL(glDepthMask, void, uint32_t m) { S.dmask = (m & 0xff) != 0; }
 GL(glDepthFunc, void, GLenum f) { if (f >= GL_NEVER && f <= GL_NEVER + 7) S.dfunc = f; }
 GL(glBlendFunc, void, GLenum s, GLenum d) { S.bsrc = S.bsa = s; S.bdst = S.bda = d; }
@@ -1200,7 +1319,7 @@ GL(glGetError, GLenum, void) { return 0; }
 // glFlush: hand the commands encoded so far to the GPU without waiting. The layer commits at the frame's end, so a game that flushes in the middle of a frame
 // (GameMaker's runner does, before a menu or a surface read) would otherwise see nothing but the pointer: eglGetProcAddress returned null for a name it only
 // asks for, the guest called it and jumped to address 0 (Well Dweller's `CRASH sig=11 addr=0 pc=0 lr=main+0x3409a78`, at the pause menu).
-GLB(glFlush, void, void) { if (g_pend_clear.bits) clears_flush(); dm_gfx_enter(); cb_commit(); dm_gfx_leave(); }
+GLB(glFlush, void, void) { if (g_pend_clear.bits) clears_flush(); if (g_cb) { dm_gfx_enter(); cb_commit(); dm_gfx_leave(); } }
 GLB(glFinish, void, void) { if (g_pend_clear.bits) clears_flush(); dm_gfx_enter(); id<MTLCommandBuffer> cb = cb_get(); cb_commit(); [cb waitUntilCompleted]; dm_gfx_leave(); }
 // Debug output and labels (LÖVE's debug groups and its GL debug callback, used when the game asks for debug output): none here
 GL(glDebugMessageCallback, void, void *cb, const void *user) { (void)cb; (void)user; }
@@ -1214,7 +1333,8 @@ GL(glObjectLabel, void, GLenum id, GLuint name, GLsizei len, const GLchar *label
 // ---------- Queries ----------
 static const char *const g_exts[] = {"GL_ARB_ES3_2_compatibility", "GL_ARB_ES3_compatibility", "GL_ARB_texture_compression_bptc", "GL_ARB_texture_compression_rgtc",
     "GL_EXT_texture_compression_s3tc", "GL_EXT_texture_filter_anisotropic", "GL_ARB_vertex_array_object", "GL_ARB_direct_state_access", "GL_ARB_half_float_vertex",
-    "GL_ARB_framebuffer_object", "GL_ARB_texture_float", "GL_EXT_texture_sRGB", "GL_KHR_texture_compression_astc_ldr", "GL_NV_shadow_samplers_cube"};
+    "GL_ARB_framebuffer_object", "GL_ARB_texture_float", "GL_EXT_texture_sRGB", "GL_KHR_texture_compression_astc_ldr", "GL_NV_shadow_samplers_cube",
+    "GL_ARB_copy_image"};   // Factorio calls glCopyImageSubData only with it (its loader asks for the name then)
 #define NEXTS (int)(sizeof g_exts / sizeof *g_exts)
 GL(glGetString, const char *, GLenum n) {
     switch (n) {
@@ -1240,7 +1360,14 @@ GL(glGetIntegerv, void, GLenum p, GLint *v) {
         case GL_MAX_TEXTURE_SIZE: case GL_MAX_RENDERBUFFER_SIZE: case GL_MAX_CUBE_MAP_TEXTURE_SIZE: *v = 16384; return;
         case GL_MAX_3D_TEXTURE_SIZE: case GL_MAX_ARRAY_TEXTURE_LAYERS: *v = 2048; return;
         case GL_MAX_VIEWPORT_DIMS: v[0] = v[1] = 16384; return;
-        case GL_MAX_COLOR_ATTACHMENTS: case GL_MAX_DRAW_BUFFERS: *v = 1; return;   // one colour attachment (fb_t)
+        case GL_MAX_COLOR_ATTACHMENTS: case GL_MAX_DRAW_BUFFERS: *v = NCOL; return;
+        case 0x8a30: *v = 65536; return;   // MAX_UNIFORM_BLOCK_SIZE: Metal's constant buffers have no limit of their own, this is NVIDIA's
+        case 0x8a2f: *v = NUBO; return;   // MAX_UNIFORM_BUFFER_BINDINGS
+        case 0x8a2b: case 0x8a2d: case 0x8a2e: *v = 12; return;   // MAX_VERTEX / FRAGMENT / COMBINED_UNIFORM_BLOCKS: the buffer slots below the vertex buffers (15–30)
+        case 0x8a34: *v = 256; return;   // UNIFORM_BUFFER_OFFSET_ALIGNMENT
+        case 0x8c2b: *v = 1 << 27; return;   // MAX_TEXTURE_BUFFER_SIZE (texels)
+        case 0x919f: *v = 16; return;   // TEXTURE_BUFFER_OFFSET_ALIGNMENT
+        case 0x8a28: *v = S.ubo_buf; return;   // UNIFORM_BUFFER_BINDING
         case GL_MAX_VERTEX_ATTRIBS: *v = 16; return;
         case GL_MAX_TEXTURE_IMAGE_UNITS: *v = 32; return;
         case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS: *v = NUNITS; return;
@@ -1286,15 +1413,35 @@ GL(glGetFloatv, void, GLenum p, GLfloat *v) {
 
 // ---------- Buffers and vertex arrays ----------
 GL(glGenBuffers, void, GLsizei n, GLuint *out) { for (GLsizei i = 0; i < n; i++) out[i] = name_new((void ***)&g_bufs, &g_nbufs, &g_capbufs, sizeof(buf_t)); }
+// The generic binding of a buffer target; NULL for a target this layer does not have
+static GLuint *buf_slot(GLenum target) {
+    switch (target) {
+        case GL_ARRAY_BUFFER: return &S.array_buf; case GL_ELEMENT_ARRAY_BUFFER: return &cur_vao()->ebo; case GL_UNIFORM_BUFFER: return &S.ubo_buf;
+        case GL_TEXTURE_BUFFER: return &S.tex_buf; case GL_COPY_READ_BUFFER: return &S.copy_rd; case GL_COPY_WRITE_BUFFER: return &S.copy_wr;
+        case GL_PIXEL_PACK_BUFFER: return &S.pack_buf; case GL_PIXEL_UNPACK_BUFFER: return &S.unpack_buf;
+    }
+    return NULL;
+}
 GL(glDeleteBuffers, void, GLsizei n, const GLuint *b) {
-    for (GLsizei i = 0; i < n; i++) { buf_t *x = buf_of(b[i]); if (!x) continue; x->mb = nil; free(x); g_bufs[b[i]] = NULL; if (S.array_buf == b[i]) S.array_buf = 0; if (cur_vao()->ebo == b[i]) cur_vao()->ebo = 0; }
+    static const GLenum targets[] = {GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, GL_UNIFORM_BUFFER, GL_TEXTURE_BUFFER, GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, GL_PIXEL_PACK_BUFFER, GL_PIXEL_UNPACK_BUFFER};
+    for (GLsizei i = 0; i < n; i++) {
+        buf_t *x = buf_of(b[i]); if (!x) continue; x->mb = nil; free(x); g_bufs[b[i]] = NULL;
+        for (size_t t = 0; t < sizeof targets / sizeof *targets; t++) { GLuint *sl = buf_slot(targets[t]); if (*sl == b[i]) *sl = 0; }
+        for (int u = 0; u < NUBO; u++) if (S.ubo[u].buf == b[i]) S.ubo[u].buf = 0;
+    }
 }
 GL(glBindBuffer, void, GLenum target, GLuint b) {
-    if (target == GL_ARRAY_BUFFER) S.array_buf = b;
-    else if (target == GL_ELEMENT_ARRAY_BUFFER) cur_vao()->ebo = b;
-    else RED1("glBindBuffer target %#x not implemented", target);
+    GLuint *sl = buf_slot(target);
+    if (sl) *sl = b; else RED1("glBindBuffer target %#x not implemented", target);
+    if (sl && (target == GL_PIXEL_PACK_BUFFER || target == GL_PIXEL_UNPACK_BUFFER) && b) RED1("pixel buffer objects (glBindBuffer %#x) are not implemented: transfers read client memory", target);
 }
-static buf_t *bound_buf(GLenum target) { return buf_of(target == GL_ARRAY_BUFFER ? S.array_buf : target == GL_ELEMENT_ARRAY_BUFFER ? cur_vao()->ebo : 0); }
+static buf_t *bound_buf(GLenum target) { GLuint *sl = buf_slot(target); return sl ? buf_of(*sl) : NULL; }
+// Indexed uniform buffer bindings, which the program's named blocks read (glUniformBlockBinding); they set the generic binding too, as in GL
+GL(glBindBufferRange, void, GLenum target, GLuint index, GLuint b, GLintptr off, GLsizeiptr size) {
+    if (target != GL_UNIFORM_BUFFER || index >= NUBO || off < 0 || size < 0) { RED1("glBindBufferRange(%#x, %u) not implemented", target, index); return; }
+    S.ubo[index].buf = b; S.ubo[index].off = (size_t)off; S.ubo[index].size = (size_t)size; S.ubo_buf = b;
+}
+GL(glBindBufferBase, void, GLenum target, GLuint index, GLuint b) { h_glBindBufferRange(target, index, b, 0, 0); }
 // Orphaning: data for a buffer a pending command buffer may still read goes into a new MTLBuffer, so draws already encoded keep the old contents
 GLB(glBufferData, void, GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
     (void)usage;
@@ -1338,6 +1485,13 @@ GLB(glMapBufferRange, void *, GLenum target, GLintptr off, GLsizeiptr len, GLbit
     return (uint8_t *)b->mb.contents + off;
 }
 GL(glUnmapBuffer, uint32_t, GLenum target) { (void)target; return 1; }
+// Between the buffers bound to two targets, in command order: as glBufferSubData with the source's bytes (the GPU never writes a buffer here)
+GLB(glCopyBufferSubData, void, GLenum rd, GLenum wr, GLintptr roff, GLintptr woff, GLsizeiptr size) {
+    buf_t *a = bound_buf(rd), *b = bound_buf(wr);
+    if (!a || !a->mb || !b || !b->mb || roff < 0 || woff < 0 || size < 0 || (size_t)(roff + size) > a->size || (size_t)(woff + size) > b->size) { RED1("glCopyBufferSubData outside its buffers"); return; }
+    void *tmp = malloc(size ? size : 1); memcpy(tmp, (uint8_t *)a->mb.contents + roff, size);
+    h_glBufferSubData(wr, woff, size, tmp); free(tmp);
+}
 GL(glFlushMappedBufferRange, void, GLenum target, GLintptr off, GLsizeiptr len) { (void)target; (void)off; (void)len; }   // shared memory: nothing to flush
 
 // ---------- Sync objects ----------
@@ -1359,6 +1513,43 @@ GLB(glClientWaitSync, GLenum, void *sy, GLbitfield flags, uint64_t timeout_ns) {
     uint64_t ms = timeout_ns / 1000000;
     return [g_ev waitUntilSignaledValue:s->serial timeoutMS:ms ? ms : 1] ? GL_CONDITION_SATISFIED : GL_TIMEOUT_EXPIRED;
 }
+// Queries: timer queries (Factorio times its frame with GL_TIMESTAMP counters) take the host clock when the call is made, as a CPU timer; their result is always available.
+// Occlusion queries report that something passed
+typedef struct { GLenum target; uint64_t begin, result; } query_t;
+NAMES(query_t, g_qs, g_nqs, g_capqs)
+static query_t *query_of(GLuint n) { return n && n < g_nqs ? g_qs[n] : NULL; }
+static GLuint g_qcur[4];   // the query each target has begun: TIME_ELAPSED, SAMPLES_PASSED, ANY_SAMPLES_PASSED, the conservative one
+static int qslot(GLenum t) { return t == 0x88bf ? 0 : t == 0x8914 ? 1 : t == 0x8c2f ? 2 : t == 0x8d6a ? 3 : -1; }
+GL(glGenQueries, void, GLsizei n, GLuint *out) { for (GLsizei i = 0; i < n; i++) out[i] = name_new((void ***)&g_qs, &g_nqs, &g_capqs, sizeof(query_t)); }
+GL(glDeleteQueries, void, GLsizei n, const GLuint *q) { for (GLsizei i = 0; i < n; i++) { query_t *x = query_of(q[i]); if (x) { free(x); g_qs[q[i]] = NULL; } } }
+GL(glIsQuery, uint32_t, GLuint q) { return query_of(q) != NULL; }
+GL(glBeginQuery, void, GLenum target, GLuint q) {
+    query_t *x = query_of(q); int k = qslot(target); if (!x || k < 0) { RED1("glBeginQuery(%#x) not implemented", target); return; }
+    if (k) RED1("occlusion queries (%#x) report that samples passed", target);
+    x->target = target; x->begin = now_ns(); x->result = k ? 1 : 0; g_qcur[k] = q;
+}
+GL(glEndQuery, void, GLenum target) {
+    int k = qslot(target); if (k < 0) return;
+    query_t *x = query_of(g_qcur[k]); g_qcur[k] = 0;
+    if (x && !k) x->result = now_ns() - x->begin;
+}
+GL(glQueryCounter, void, GLuint q, GLenum target) { query_t *x = query_of(q); if (x && target == 0x8e28 /* TIMESTAMP */) { x->target = target; x->result = now_ns(); } }
+static uint64_t query_get(GLuint q, GLenum pn) {
+    query_t *x = query_of(q);
+    if (pn == 0x8867) return 1;   // QUERY_RESULT_AVAILABLE
+    if (pn == 0x8866 || pn == 0x9194) return x ? x->result : 0;   // QUERY_RESULT, QUERY_RESULT_NO_WAIT
+    RED1("glGetQueryObject(%#x) not implemented", pn); return 0;
+}
+GL(glGetQueryObjectiv, void, GLuint q, GLenum pn, GLint *v) { *v = (GLint)query_get(q, pn); }
+GL(glGetQueryObjectuiv, void, GLuint q, GLenum pn, GLuint *v) { *v = (GLuint)query_get(q, pn); }
+GL(glGetQueryObjecti64v, void, GLuint q, GLenum pn, int64_t *v) { *v = (int64_t)query_get(q, pn); }
+GL(glGetQueryObjectui64v, void, GLuint q, GLenum pn, uint64_t *v) { *v = query_get(q, pn); }
+GL(glGetQueryiv, void, GLenum target, GLenum pn, GLint *v) {
+    int k = qslot(target);
+    if (pn == 0x8865) *v = k >= 0 ? (GLint)g_qcur[k] : 0;   // CURRENT_QUERY
+    else if (pn == 0x8864) *v = 64;   // QUERY_COUNTER_BITS
+    else { RED1("glGetQueryiv(%#x) not implemented", pn); *v = 0; }
+}
 GL(glGenVertexArrays, void, GLsizei n, GLuint *out) { for (GLsizei i = 0; i < n; i++) out[i] = name_new((void ***)&g_vaos, &g_nvaos, &g_capvaos, sizeof(vao_t)); }
 GL(glDeleteVertexArrays, void, GLsizei n, const GLuint *v) { for (GLsizei i = 0; i < n; i++) if (v[i] && v[i] < g_nvaos && g_vaos[v[i]]) { free(g_vaos[v[i]]); g_vaos[v[i]] = NULL; if (S.vao == v[i]) S.vao = 0; } }
 GL(glBindVertexArray, void, GLuint v) { S.vao = v; }
@@ -1369,6 +1560,8 @@ GL(glVertexAttribPointer, void, GLuint i, GLint size, GLenum type, uint32_t norm
     if (i >= 16) { RED1("vertex attribute %u over 15", i); return; }
     vattr_t *a = &cur_vao()->a[i]; a->size = size == 0x80e1 ? 4 : size; a->type = type; a->norm = (norm & 0xff) != 0; a->stride = stride; a->off = (uintptr_t)ptr; a->buf = S.array_buf;
 }
+// Integer inputs (uint / uvec2 vertex attributes): the integer vertex formats, which vfmt_of gives an attribute that is not normalized
+GL(glVertexAttribIPointer, void, GLuint i, GLint size, GLenum type, GLsizei stride, const void *ptr) { h_glVertexAttribPointer(i, size, type, 0, stride, ptr); }
 GL(glVertexAttribDivisor, void, GLuint i, GLuint d) { if (i < 16) cur_vao()->a[i].div = d > 255 ? 255 : (uint8_t)d; }
 GL(glVertexAttrib4f, void, GLuint i, GLfloat x, GLfloat y, GLfloat z, GLfloat w) { if (i < 16) { S.va[i][0] = x; S.va[i][1] = y; S.va[i][2] = z; S.va[i][3] = w; } }
 GL(glVertexAttrib4fv, void, GLuint i, const GLfloat *v) { if (i < 16) memcpy(S.va[i], v, sizeof S.va[i]); }
@@ -1381,13 +1574,13 @@ GL(glDeleteTextures, void, GLsizei n, const GLuint *t) {
         tex_drop(x); x->smp = nil; free(x); g_texs[t[i]] = NULL;
         for (int u = 0; u < NUNITS; u++) {
             if (S.units[u].t2d == t[i]) S.units[u].t2d = 0; if (S.units[u].tcube == t[i]) S.units[u].tcube = 0;
-            if (S.units[u].t3d == t[i]) S.units[u].t3d = 0; if (S.units[u].t2da == t[i]) S.units[u].t2da = 0;
+            if (S.units[u].t3d == t[i]) S.units[u].t3d = 0; if (S.units[u].t2da == t[i]) S.units[u].t2da = 0; if (S.units[u].tbuf == t[i]) S.units[u].tbuf = 0;
         }
     }
 }
 GL(glActiveTexture, void, GLenum u) { if (u >= GL_TEXTURE0 && u < GL_TEXTURE0 + NUNITS) S.unit = u - GL_TEXTURE0; }
 GL(glBindTexture, void, GLenum target, GLuint t) {
-    GLuint *slot = target == GL_TEXTURE_2D || target == GL_TEXTURE_CUBE_MAP || target == GL_TEXTURE_3D || target == GL_TEXTURE_2D_ARRAY ? unit_slot(S.unit, target) : NULL;
+    GLuint *slot = target == GL_TEXTURE_2D || target == GL_TEXTURE_CUBE_MAP || target == GL_TEXTURE_3D || target == GL_TEXTURE_2D_ARRAY || target == GL_TEXTURE_BUFFER ? unit_slot(S.unit, target) : NULL;
     if (!slot) { RED1("texture target %#x not implemented", target); return; }
     tex_t *x = tex_of(t);
     if (t && !x) {   // a name glGenTextures never gave: GL makes the texture on its first bind
@@ -1397,8 +1590,7 @@ GL(glBindTexture, void, GLenum target, GLuint t) {
     if (x && !x->target) tex_init_params(x, target);
     *slot = t;
 }
-static void tex_param(GLenum target, GLenum p, float f, GLint i) {
-    tex_t *t = bound_tex(target);
+static void tex_param_of(tex_t *t, GLenum p, float f, GLint i) {
     if (!t) return;
     switch (p) {
         case GL_TEXTURE_MIN_FILTER: t->minf = i; break; case GL_TEXTURE_MAG_FILTER: t->magf = i; break;
@@ -1415,6 +1607,7 @@ static void tex_param(GLenum target, GLenum p, float f, GLint i) {
     }
     t->smp_dirty = 1;
 }
+static void tex_param(GLenum target, GLenum p, float f, GLint i) { tex_param_of(bound_tex(target), p, f, i); }
 GL(glTexParameteri, void, GLenum target, GLenum p, GLint v) { tex_param(target, p, (float)v, v); }
 GL(glTexParameterf, void, GLenum target, GLenum p, GLfloat v) { tex_param(target, p, v, (GLint)v); }
 GL(glTexParameterfv, void, GLenum target, GLenum p, const GLfloat *v) {
@@ -1432,7 +1625,8 @@ static void teximg_impl(const teximg_args *a) {
             int face = a->target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && a->target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? (int)(a->target - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : 0;
             if (!t || t->fmt < 0 || a->w <= 0 || a->h <= 0) return;
             int f = t->fmt, cv = CV_COPY;   // the data is converted to the texture's format
-            if (f == F_RGBA8) cv = a->type == GL_UNSIGNED_SHORT_5_6_5 ? CV_565 : a->type == GL_UNSIGNED_SHORT_4_4_4_4 ? CV_4444 : a->type == GL_UNSIGNED_SHORT_5_5_5_1 ? CV_5551 :
+            if (a->compressed && g_fmt[f].kind != K_BLOCK) { RED1("glCompressedTexSubImage2D into a %s texture", g_fmt[f].name); return; }
+            if (f == F_RGBA8 && !a->compressed) cv = a->type == GL_UNSIGNED_SHORT_5_6_5 ? CV_565 : a->type == GL_UNSIGNED_SHORT_4_4_4_4 ? CV_4444 : a->type == GL_UNSIGNED_SHORT_5_5_5_1 ? CV_5551 :
                                    a->format == GL_RGB ? CV_RGB8 : a->format == GL_COLOR_INDEX ? CV_INDEX : CV_COPY;
             size_t pitch; void *conv = pixels_convert(a->pixels, a->w, a->h, a->format, a->type, f, cv, &pitch);
             if (!t->made) {   // into a level not made yet: patch the pending copy
@@ -1463,6 +1657,10 @@ GL(glTexImage2D, void, GLenum target, GLint level, GLint ifmt, GLsizei w, GLsize
 }
 GL(glTexSubImage2D, void, GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, const void *pixels) {
     teximg_args a = {target, level, 0, x, y, w, h, format, type, pixels, 0, 1, 0}; ((void (*)(const teximg_args *))(const void *)teximg_impl_bs)(&a);
+}
+// a part of a compressed level: whole blocks, as the format's own bytes (Factorio uploads its sprite atlases so, block rows of an atlas at a time)
+GL(glCompressedTexSubImage2D, void, GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLsizei size, const void *data) {
+    (void)format; teximg_args a = {target, level, 0, x, y, w, h, 0, 0, data, size, 1, 1}; ((void (*)(const teximg_args *))(const void *)teximg_impl_bs)(&a);
 }
 GL(glCompressedTexImage2D, void, GLenum target, GLint level, GLenum ifmt, GLsizei w, GLsizei h, GLint border, GLsizei size, const void *data) {
     (void)border; teximg_args a = {target, level, (GLint)ifmt, 0, 0, w, h, 0, 0, data, size, 0, 1}; ((void (*)(const teximg_args *))(const void *)teximg_impl_bs)(&a);
@@ -1532,6 +1730,65 @@ static void mip_impl(GLenum target) {
     }
 }
 GL(glGenerateMipmap, void, GLenum target) { ((void (*)(GLenum))(const void *)mip_impl_bs)(target); }
+// Buffer textures (Factorio's vertex shaders look up texture coordinates in one, a samplerBuffer): a Metal texture buffer over the buffer's MTLBuffer, made again when glBufferData
+// orphans the MTLBuffer or the range changes; size 0 = to the end of the buffer
+static void tex_buffer(GLenum target, GLenum ifmt, GLuint b, size_t off, size_t size) {
+    tex_t *t = bound_tex(target);
+    int cv, f = fmt_pick((GLint)ifmt, 0, 0, &cv);
+    if (target != GL_TEXTURE_BUFFER || !t || f < 0 || g_fmt[f].kind != K_COL) { RED1("glTexBuffer(%#x, %#x) not implemented", target, ifmt); return; }
+    t->fmt = f; t->tb_buf = b; t->tb_off = off; t->tb_size = size; t->tb_src = nil; t->tex = nil; t->made = 0; t->gen++;
+}
+GL(glTexBuffer, void, GLenum target, GLenum ifmt, GLuint b) { tex_buffer(target, ifmt, b, 0, 0); }
+GL(glTexBufferARB, void, GLenum target, GLenum ifmt, GLuint b) { tex_buffer(target, ifmt, b, 0, 0); }
+GL(glTexBufferRange, void, GLenum target, GLenum ifmt, GLuint b, GLintptr off, GLsizeiptr size) { tex_buffer(target, ifmt, b, (size_t)off, (size_t)size); }
+static id<MTLTexture> tex_buffer_view(tex_t *t) {
+    buf_t *b = buf_of(t->tb_buf);
+    if (!b || !b->mb || t->fmt < 0) return nil;
+    if (t->tex && t->tb_src == b->mb) return t->tex;
+    size_t bpp = g_fmt[t->fmt].bytes, off = t->tb_off, end = t->tb_size ? umin(b->size, t->tb_off + t->tb_size) : b->size;
+    NSUInteger align = [g_dev minimumLinearTextureAlignmentForPixelFormat:g_fmt[t->fmt].pf];
+    if (off % align) { RED1("buffer texture at offset %zu: Metal needs %lu-byte alignment", off, (unsigned long)align); return nil; }
+    if (end <= off) return nil;
+    NSUInteger w = (end - off) / bpp, pitch = (w * bpp + align - 1) / align * align;
+    if (off + pitch > b->mb.length) { w = (b->mb.length - off) / bpp; pitch = w * bpp / align * align; w = pitch / bpp; }
+    if (!w) return nil;
+    @autoreleasepool {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:g_fmt[t->fmt].pf width:w resourceOptions:b->mb.resourceOptions usage:MTLTextureUsageShaderRead];
+        t->tex = [b->mb newTextureWithDescriptor:td offset:off bytesPerRow:pitch];
+    }
+    t->tb_src = b->mb; t->made = 1; t->levels = 1;
+    return t->tex;
+}
+
+// ---------- Sampler objects ----------
+GL(glGenSamplers, void, GLsizei n, GLuint *out) {
+    for (GLsizei i = 0; i < n; i++) { out[i] = name_new((void ***)&g_smps, &g_nsmps, &g_capsmps, sizeof(tex_t)); tex_init_params(g_smps[out[i]], GL_TEXTURE_2D); }
+}
+GL(glDeleteSamplers, void, GLsizei n, const GLuint *v) {
+    for (GLsizei i = 0; i < n; i++) {
+        tex_t *x = smp_of(v[i]); if (!x) continue;
+        x->smp = nil; free(x); g_smps[v[i]] = NULL;
+        for (int u = 0; u < NUNITS; u++) if (S.units[u].smp == v[i]) S.units[u].smp = 0;
+    }
+}
+GL(glBindSampler, void, GLuint unit, GLuint v) { if (unit < NUNITS) S.units[unit].smp = v; }
+GL(glSamplerParameteri, void, GLuint v, GLenum p, GLint x) { tex_param_of(smp_of(v), p, (float)x, x); }
+GL(glSamplerParameterf, void, GLuint v, GLenum p, GLfloat x) { tex_param_of(smp_of(v), p, x, (GLint)x); }
+GL(glSamplerParameteriv, void, GLuint v, GLenum p, const GLint *x) {
+    tex_t *t = smp_of(v);
+    if (p == GL_TEXTURE_BORDER_COLOR) { if (t) { for (int c = 0; c < 4; c++) t->border[c] = x[c] / 2147483647.0f; t->smp_dirty = 1; } return; }
+    tex_param_of(t, p, (float)x[0], x[0]);
+}
+GL(glSamplerParameterfv, void, GLuint v, GLenum p, const GLfloat *x) {
+    tex_t *t = smp_of(v);
+    if (p == GL_TEXTURE_BORDER_COLOR) { if (t) { memcpy(t->border, x, sizeof t->border); t->smp_dirty = 1; } return; }
+    tex_param_of(t, p, x[0], (GLint)x[0]);
+}
+// The Metal sampler for a texture sampled through a sampler object: the object's parameters with the texture's target and level count
+static id<MTLSamplerState> smp_state(tex_t *s, const tex_t *t) {
+    if (s->levels != t->levels || s->target != t->target) { s->levels = t->levels; s->target = t->target; s->smp_dirty = 1; }
+    return tex_sampler(s);
+}
 
 // ---------- Framebuffers and renderbuffers ----------
 GL(glGenFramebuffers, void, GLsizei n, GLuint *out) { for (GLsizei i = 0; i < n; i++) out[i] = name_new((void ***)&g_fbs, &g_nfbs, &g_capfbs, sizeof(fb_t)); }
@@ -1546,10 +1803,19 @@ GLB(glBindFramebuffer, void, GLenum target, GLuint f) {
     S.fb = f;   // the pass ends at the next draw or clear into another framebuffer (pass_ensure)
 }
 GL(glCheckFramebufferStatus, GLenum, GLenum target) { (void)target; return GL_FRAMEBUFFER_COMPLETE; }
-// One colour attachment: GL_NONE (LÖVE's depth-only canvases) and attachment 0 are the same draw buffer here
-GL(glDrawBuffers, void, GLsizei n, const GLenum *b) { if (n > 1) RED1("glDrawBuffers of %d buffers (one colour attachment is implemented)", n); (void)b; }
-GL(glDrawBuffer, void, GLenum b) { (void)b; }
-GL(glReadBuffer, void, GLenum b) { (void)b; }
+// The draw framebuffer's draw buffers: fragment output i writes colour attachment b[i] (GL_NONE: none; LÖVE's depth-only canvases). Framebuffer 0 has its one image
+GLB(glDrawBuffers, void, GLsizei n, const GLenum *b) {
+    fb_t *f = fb_of(S.fb); if (!f || n < 0) return;
+    for (int i = 0; i < NCOL; i++) {
+        GLenum x = i < n ? b[i] : GL_NONE;
+        f->draw[i] = x >= GL_COLOR_ATTACHMENT0 && x < GL_COLOR_ATTACHMENT0 + NCOL ? (int8_t)(x - GL_COLOR_ATTACHMENT0) : -1;
+        if (x != GL_NONE && f->draw[i] < 0) RED1("glDrawBuffers(%#x) not implemented", x);
+    }
+    if (n > NCOL) RED1("glDrawBuffers of %d buffers (%d are implemented)", n, NCOL);
+    f->draw_set = 1; f->gen++;
+}
+GLB(glDrawBuffer, void, GLenum b) { if (S.fb) h_glDrawBuffers(1, &b); }
+GL(glReadBuffer, void, GLenum b) { fb_t *f = fb_of(S.read_fb); if (f && b >= GL_COLOR_ATTACHMENT0 && b < GL_COLOR_ATTACHMENT0 + NCOL) f->read = (int)(b - GL_COLOR_ATTACHMENT0); }
 GL(glInvalidateFramebuffer, void, GLenum target, GLsizei n, const GLenum *att) { (void)target; (void)n; (void)att; }   // the contents are kept (a store action)
 GL(glDiscardFramebufferEXT, void, GLenum target, GLsizei n, const GLenum *att) { (void)target; (void)n; (void)att; }
 GL(glGenRenderbuffers, void, GLsizei n, GLuint *out) { for (GLsizei i = 0; i < n; i++) out[i] = name_new((void ***)&g_rbs, &g_nrbs, &g_caprbs, sizeof(rb_t)); }
@@ -1585,7 +1851,7 @@ static void fb_attach(GLenum target, GLenum attachment, int kind, GLuint name, i
     if (!f) { RED1("attachment to framebuffer 0 or to one never generated"); return; }
     att_t a = {kind, name, level, face};
     if (!name) a.kind = 0;
-    if (attachment == GL_COLOR_ATTACHMENT0) f->col = a;
+    if (attachment >= GL_COLOR_ATTACHMENT0 && attachment < GL_COLOR_ATTACHMENT0 + NCOL) f->col[attachment - GL_COLOR_ATTACHMENT0] = a;
     else if (attachment == GL_DEPTH_ATTACHMENT) f->depth = a;
     else if (attachment == GL_STENCIL_ATTACHMENT) f->stencil = a;
     else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT) f->depth = f->stencil = a;
@@ -1606,9 +1872,9 @@ static id<MTLTexture> fb_color(GLuint fb, int *level, int *slice) {
     *level = *slice = 0;
     if (!fb) { if (!g_win.made) { int w, h; dm_vi_layer_size(&w, &h); win_make(w > 0 ? w : 1280, h > 0 ? h : 720); } return g_win.col[g_win.cur]; }
     fb_t *f = fb_of(fb); uint64_t g = 0;
-    if (!f || f->col.kind == 0) return nil;
-    *level = f->col.level; *slice = f->col.face;
-    return att_tex(&f->col, &g);
+    if (!f || f->col[f->read].kind == 0) return nil;
+    *level = f->col[f->read].level; *slice = f->col[f->read].face;
+    return att_tex(&f->col[f->read], &g);
 }
 // glBlitFramebuffer of colour without scaling, flipping or a format change (LÖVE resolves multisampled canvases so); its last two arguments are on the stack, 64-bit here
 typedef struct { GLint s[4], d[4]; GLbitfield mask; } blit_args;
@@ -1633,6 +1899,87 @@ static void blit_impl(const blit_args *a) {
 }
 GL(glBlitFramebuffer, void, GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1, uint64_t mask, uint64_t filter) {
     (void)filter; blit_args a = {{sx0, sy0, sx1, sy1}, {dx0, dy0, dx1, dy1}, (GLbitfield)mask}; ((void (*)(const blit_args *))(const void *)blit_impl_bs)(&a);
+}
+// glCopyImageSubData between textures or renderbuffers of the same pixel format, in command order (a blit in the frame's command buffer); 15 arguments, the last seven on the
+// stack, 64-bit here as glBlitFramebuffer's. z: an array layer or cube face, or a 3D texture's slice
+typedef struct { GLuint name[2]; GLenum target[2]; GLint level[2], x[2], y[2], z[2]; GLsizei w, h, d; } copyimg_args;
+static id<MTLTexture> copy_tex(GLuint name, GLenum target) {
+    if (target == GL_RENDERBUFFER) { rb_t *r = rb_of(name); return r ? r->tex : nil; }
+    tex_t *t = tex_of(name);
+    if (!t || (!t->made && !tex_make(t, 0)) || !t->tex) return nil;
+    t->use = g_serial; return t->tex;
+}
+static void copyimg_impl(const copyimg_args *a) __attribute__((used));
+BIGSTUB(copyimg_impl);
+static void copyimg_impl(const copyimg_args *a) {
+    @autoreleasepool {
+        if (a->w <= 0 || a->h <= 0 || a->d <= 0) return;
+        if (g_pend_clear.bits) clears_flush();
+        id<MTLTexture> src = copy_tex(a->name[0], a->target[0]), dst = copy_tex(a->name[1], a->target[1]);
+        if (!src || !dst) { RED1("glCopyImageSubData of an image that is not made"); return; }
+        pass_end();
+        id<MTLBlitCommandEncoder> b = [cb_get() blitCommandEncoder];
+        if (src.pixelFormat != dst.pixelFormat) {
+            // formats of one size (GL's compatible formats): through transient memory. Factorio compresses its atlases on the GPU so: a shader writes each 4x4 block into a
+            // texel of an RG32UI / RGBA32UI target, which is copied into the BC4 / BC3 / BC7 texture, a texel to a block
+            int fs = fmt_of_pf(src.pixelFormat), fd = fmt_of_pf(dst.pixelFormat);
+            if (fs < 0 || fd < 0 || g_fmt[fs].bytes != g_fmt[fd].bytes) { [b endEncoding]; RED1("glCopyImageSubData between pixel formats of different sizes"); return; }
+            const fmt_t *ms = &g_fmt[fs], *md = &g_fmt[fd];
+            uint32_t bw = ((uint32_t)a->w + ms->bw - 1) / ms->bw, bh = ((uint32_t)a->h + ms->bh - 1) / ms->bh;   // the region in blocks (texels of an uncompressed format)
+            size_t pitch = (size_t)bw * ms->bytes;
+            // the destination's size in its texels, kept inside its level (a compressed level smaller than a block takes the whole block)
+            uint32_t dw = bw * md->bw, dh = bh * md->bh, lw = umax(1, (uint32_t)dst.width >> a->level[1]), lh = umax(1, (uint32_t)dst.height >> a->level[1]);
+            if ((uint32_t)a->x[1] + dw > lw) dw = lw - a->x[1];
+            if ((uint32_t)a->y[1] + dh > lh) dh = lh - a->y[1];
+            for (GLsizei k = 0; k < a->d; k++) {
+                size_t off; id<MTLBuffer> st = arena_alloc(pitch * bh, &off);
+                [b copyFromTexture:src sourceSlice:a->z[0] + k sourceLevel:a->level[0] sourceOrigin:MTLOriginMake(a->x[0], a->y[0], 0) sourceSize:MTLSizeMake(bw * ms->bw, bh * ms->bh, 1)
+                          toBuffer:st destinationOffset:off destinationBytesPerRow:pitch destinationBytesPerImage:pitch * bh];
+                [b copyFromBuffer:st sourceOffset:off sourceBytesPerRow:pitch sourceBytesPerImage:pitch * bh sourceSize:MTLSizeMake(dw, dh, 1)
+                        toTexture:dst destinationSlice:a->z[1] + k destinationLevel:a->level[1] destinationOrigin:MTLOriginMake(a->x[1], a->y[1], 0)];
+            }
+            [b endEncoding]; g_n_blit++;
+            return;
+        }
+        for (GLsizei k = 0; k < a->d; k++) {
+            int v0 = src.textureType == MTLTextureType3D, v1 = dst.textureType == MTLTextureType3D;
+            [b copyFromTexture:src sourceSlice:v0 ? 0 : a->z[0] + k sourceLevel:a->level[0] sourceOrigin:MTLOriginMake(a->x[0], a->y[0], v0 ? a->z[0] + k : 0) sourceSize:MTLSizeMake(a->w, a->h, 1)
+                     toTexture:dst destinationSlice:v1 ? 0 : a->z[1] + k destinationLevel:a->level[1] destinationOrigin:MTLOriginMake(a->x[1], a->y[1], v1 ? a->z[1] + k : 0)];
+        }
+        [b endEncoding]; g_n_blit++;
+    }
+}
+GL(glCopyImageSubData, void, GLuint sn, GLenum st, GLint sl, GLint sx, GLint sy, GLint sz, GLuint dn, GLenum dt, uint64_t dl, uint64_t dx, uint64_t dy, uint64_t dz, uint64_t w, uint64_t h, uint64_t d) {
+    copyimg_args a = {{sn, dn}, {st, dt}, {sl, (GLint)dl}, {sx, (GLint)dx}, {sy, (GLint)dy}, {sz, (GLint)dz}, (GLsizei)w, (GLsizei)h, (GLsizei)d};
+    ((void (*)(const copyimg_args *))(const void *)copyimg_impl_bs)(&a);
+}
+// glCopyTexSubImage2D / 3D: a rectangle of the read framebuffer's colour image into a texture level (3D: a layer of an array texture, or a slice), in command order; the formats
+// must agree, as a blit copies. The last argument is on the stack, 64-bit here
+typedef struct { GLenum target; GLint level, xo, yo, zo, x, y; GLsizei w, h; } copytex_args;
+static void copytex_impl(const copytex_args *a) __attribute__((used));
+BIGSTUB(copytex_impl);
+static void copytex_impl(const copytex_args *a) {
+    @autoreleasepool {
+        if (a->w <= 0 || a->h <= 0) return;
+        if (g_pend_clear.bits) clears_flush();
+        tex_t *t = bound_tex(a->target);
+        int face = a->target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && a->target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? (int)(a->target - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : 0;
+        int lv, sl; id<MTLTexture> src = fb_color(S.read_fb, &lv, &sl);
+        if (!t || (!t->made && !tex_make(t, 1)) || !t->tex || !src || a->level >= t->levels) { RED1("glCopyTexSubImage into a texture or from a framebuffer that is not made"); return; }
+        if (src.pixelFormat != t->tex.pixelFormat) { RED1("glCopyTexSubImage between pixel formats %lu and %lu not implemented", (unsigned long)src.pixelFormat, (unsigned long)t->tex.pixelFormat); return; }
+        int vol = t->target == GL_TEXTURE_3D;
+        pass_end();
+        id<MTLBlitCommandEncoder> b = [cb_get() blitCommandEncoder];
+        [b copyFromTexture:src sourceSlice:sl sourceLevel:lv sourceOrigin:MTLOriginMake(a->x, a->y, 0) sourceSize:MTLSizeMake(a->w, a->h, 1)
+                 toTexture:t->tex destinationSlice:vol ? 0 : face + a->zo destinationLevel:a->level destinationOrigin:MTLOriginMake(a->xo, a->yo, vol ? a->zo : 0)];
+        [b endEncoding]; g_n_blit++; t->use = g_serial;
+    }
+}
+GL(glCopyTexSubImage2D, void, GLenum target, GLint level, GLint xo, GLint yo, GLint x, GLint y, GLsizei w, GLsizei h) {
+    copytex_args a = {target, level, xo, yo, 0, x, y, w, h}; ((void (*)(const copytex_args *))(const void *)copytex_impl_bs)(&a);
+}
+GL(glCopyTexSubImage3D, void, GLenum target, GLint level, GLint xo, GLint yo, GLint zo, GLint x, GLint y, GLsizei w, uint64_t h) {
+    copytex_args a = {target, level, xo, yo, zo, x, y, w, (GLsizei)h}; ((void (*)(const copytex_args *))(const void *)copytex_impl_bs)(&a);
 }
 GL(glResolveMultisampleFramebufferAPPLE, void, void) { RED1("glResolveMultisampleFramebufferAPPLE not implemented"); }
 // glReadPixels: everything recorded so far runs first (the frame's command buffer is committed and waited for), then the rows are copied out as GL lays them, bottom row first,
@@ -1666,6 +2013,107 @@ static void readpix_impl(const readpix_args *a) {
             else for (GLsizei x = 0; x < a->w; x++) { d[4 * x] = s[4 * x + 2]; d[4 * x + 1] = s[4 * x + 1]; d[4 * x + 2] = s[4 * x]; d[4 * x + 3] = s[4 * x + 3]; }
         }
     }
+}
+// A texture level read back (Factorio reads its 3D colour lookup tables and the atlases it compressed on the GPU): everything recorded so far runs first, then the level's bytes
+// as the Metal texture holds them, rows packed by GL_PACK_ALIGNMENT (compressed data: rows of blocks). Only a format and type of the texture's own texel size are given back
+typedef struct { GLenum target; GLint level; GLenum format, type; void *data; int compressed; } gettex_args;
+// BC1–BC5 blocks decoded to RGBA8, as a GL driver gives a compressed level to glGetTexImage (Factorio checks its GPU compressor so at start: it compresses a test image, reads the
+// BC3 result back as RGBA8 and compares; with no answer it compressed every atlas on the CPU, about ten seconds more at start)
+static void bc_alpha(const uint8_t *b, uint8_t out[16]) {   // BC3's / BC4's 8-byte channel block
+    uint8_t a0 = b[0], a1 = b[1], pal[8] = {a0, a1};
+    for (int i = 2; i < 8; i++) pal[i] = a0 > a1 ? (uint8_t)(((8 - i) * a0 + (i - 1) * a1) / 7) : i < 6 ? (uint8_t)(((6 - i) * a0 + (i - 1) * a1) / 5) : i == 6 ? 0 : 255;
+    uint64_t bits = 0; for (int i = 0; i < 6; i++) bits |= (uint64_t)b[2 + i] << (8 * i);
+    for (int i = 0; i < 16; i++) out[i] = pal[bits >> (3 * i) & 7];
+}
+static void bc_color(const uint8_t *b, uint8_t out[16][4], int bc1) {   // BC1's 8-byte colour block (in BC2 / BC3 always four colours)
+    uint16_t c0 = b[0] | b[1] << 8, c1 = b[2] | b[3] << 8; uint8_t pal[4][4];
+    for (int k = 0; k < 2; k++) { uint16_t c = k ? c1 : c0; pal[k][0] = (c >> 11) * 255 / 31; pal[k][1] = (c >> 5 & 63) * 255 / 63; pal[k][2] = (c & 31) * 255 / 31; pal[k][3] = 255; }
+    for (int ch = 0; ch < 3; ch++) {
+        if (c0 > c1 || !bc1) { pal[2][ch] = (uint8_t)((2 * pal[0][ch] + pal[1][ch]) / 3); pal[3][ch] = (uint8_t)((pal[0][ch] + 2 * pal[1][ch]) / 3); }
+        else { pal[2][ch] = (uint8_t)((pal[0][ch] + pal[1][ch]) / 2); pal[3][ch] = 0; }
+    }
+    pal[2][3] = 255; pal[3][3] = c0 > c1 || !bc1 ? 255 : 0;
+    uint32_t idx = b[4] | b[5] << 8 | b[6] << 16 | (uint32_t)b[7] << 24;
+    for (int i = 0; i < 16; i++) memcpy(out[i], pal[idx >> (2 * i) & 3], 4);
+}
+static int bc_decode(int f, const uint8_t *src, uint32_t w, uint32_t h, size_t spitch, uint8_t *dst, size_t dpitch) {
+    if (f != F_BC1 && f != F_BC1_RGB && f != F_BC1_SRGB && f != F_BC2 && f != F_BC2_SRGB && f != F_BC3 && f != F_BC3_SRGB && f != F_BC4 && f != F_BC5) return 0;
+    for (uint32_t by = 0; by < (h + 3) / 4; by++) for (uint32_t bx = 0; bx < (w + 3) / 4; bx++) {
+        const uint8_t *b = src + by * spitch + (size_t)bx * g_fmt[f].bytes; uint8_t px[16][4], a[16], g[16];
+        if (f == F_BC4 || f == F_BC5) {
+            bc_alpha(b, a); if (f == F_BC5) bc_alpha(b + 8, g);
+            for (int i = 0; i < 16; i++) { px[i][0] = a[i]; px[i][1] = f == F_BC5 ? g[i] : 0; px[i][2] = 0; px[i][3] = 255; }
+        } else if (f == F_BC2 || f == F_BC2_SRGB) {
+            bc_color(b + 8, px, 0);
+            for (int i = 0; i < 16; i++) px[i][3] = (b[i / 2] >> (4 * (i & 1)) & 15) * 17;
+        } else if (f == F_BC3 || f == F_BC3_SRGB) { bc_color(b + 8, px, 0); bc_alpha(b, a); for (int i = 0; i < 16; i++) px[i][3] = a[i]; }
+        else { bc_color(b, px, 1); if (f == F_BC1_RGB) for (int i = 0; i < 16; i++) px[i][3] = 255; }
+        for (int i = 0; i < 16; i++) {
+            uint32_t x = bx * 4 + (i & 3), y = by * 4 + i / 4;
+            if (x < w && y < h) memcpy(dst + y * dpitch + 4 * x, px[i], 4);
+        }
+    }
+    return 1;
+}
+static void gettex_impl(const gettex_args *a) __attribute__((used));
+BIGSTUB(gettex_impl);
+static void gettex_impl(const gettex_args *a) {
+    @autoreleasepool {
+        tex_t *t = bound_tex(a->target);
+        int face = a->target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && a->target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z ? (int)(a->target - GL_TEXTURE_CUBE_MAP_POSITIVE_X) : 0;
+        if (!t || !a->data || (!t->made && !tex_make(t, 0)) || !t->tex || a->level < 0 || a->level >= t->levels) { RED1("glGetTexImage of a texture or level that is not made"); return; }
+        const fmt_t *m = &g_fmt[t->fmt];
+        if (t->target == GL_TEXTURE_2D_ARRAY) { RED1("glGetTexImage of an array texture not implemented"); return; }
+        int decode = !a->compressed && m->kind == K_BLOCK;   // RGBA8 from BC1–BC5 blocks (bc_decode)
+        if (decode && (a->format != GL_RGBA || a->type != GL_UNSIGNED_BYTE)) { RED1("glGetTexImage(%#x, %#x) of a %s texture (compressed) not implemented", a->format, a->type, m->name); return; }
+        if (a->compressed && m->kind != K_BLOCK) { RED1("glGetCompressedTexImage of an uncompressed texture"); return; }
+        if (!a->compressed && !decode) {
+            int comps = a->format == GL_RGBA || a->format == GL_BGRA || a->format == 0x8d99 ? 4 : a->format == GL_RGB || a->format == 0x8d98 ? 3 : a->format == GL_RG || a->format == 0x8228 ? 2 : 1;
+            int tb = a->type == GL_FLOAT || a->type == GL_UNSIGNED_INT || a->type == GL_INT ? 4 : a->type == GL_HALF_FLOAT || a->type == GL_UNSIGNED_SHORT || a->type == GL_SHORT ? 2 : 1;
+            if (comps * tb != m->bytes || (a->format == GL_BGRA) != (t->fmt == F_BGRA8) || m->kind != K_COL) { RED1("glGetTexImage(%#x, %#x) of a %s texture not implemented", a->format, a->type, m->name); return; }
+        }
+        uint32_t w = umax(1, t->w >> a->level), h = umax(1, (t->target == GL_TEXTURE_CUBE_MAP ? t->w : t->h) >> a->level);
+        uint32_t layers = t->target == GL_TEXTURE_3D ? umax(1, t->d >> a->level) : 1;
+        size_t pitch = fmt_pitch(t->fmt, w), rows = fmt_rows(t->fmt, h), image = pitch * rows;
+        if (g_pend_clear.bits) clears_flush();
+        dm_gfx_enter();
+        pass_end();
+        id<MTLBuffer> out = [g_dev newBufferWithLength:image * layers options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = cb_get();
+        id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+        [b copyFromTexture:t->tex sourceSlice:face sourceLevel:a->level sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, layers) toBuffer:out destinationOffset:0
+            destinationBytesPerRow:pitch destinationBytesPerImage:image];
+        [b endEncoding];
+        t->use = g_serial;
+        cb_commit(); [cb waitUntilCompleted];
+        dm_gfx_leave();
+        if (decode) {
+            size_t dp = ((size_t)w * 4 + S.pack_align - 1) / S.pack_align * S.pack_align;
+            if (!bc_decode(t->fmt, out.contents, w, h, pitch, a->data, dp)) RED1("glGetTexImage of a %s texture (compressed) not implemented", m->name);
+            return;
+        }
+        size_t dp = a->compressed ? pitch : (pitch + S.pack_align - 1) / S.pack_align * S.pack_align;
+        for (size_t r = 0; r < rows * layers; r++) memcpy((uint8_t *)a->data + r * dp, (const uint8_t *)out.contents + r * pitch, pitch);
+    }
+}
+GL(glGetTexImage, void, GLenum target, GLint level, GLenum format, GLenum type, void *data) {
+    gettex_args a = {target, level, format, type, data, 0}; ((void (*)(const gettex_args *))(const void *)gettex_impl_bs)(&a);
+}
+GL(glGetCompressedTexImage, void, GLenum target, GLint level, void *data) {
+    gettex_args a = {target, level, 0, 0, data, 1}; ((void (*)(const gettex_args *))(const void *)gettex_impl_bs)(&a);
+}
+GL(glGetTexLevelParameteriv, void, GLenum target, GLint level, GLenum pn, GLint *v) {
+    tex_t *t = bound_tex(target); *v = 0;
+    if (!t || t->fmt < 0 || level < 0) return;
+    uint32_t w = umax(1, t->w >> level), h = umax(1, (t->target == GL_TEXTURE_CUBE_MAP ? t->w : t->h) >> level);
+    switch (pn) {
+        case 0x1000: *v = (GLint)w; return;   // TEXTURE_WIDTH
+        case 0x1001: *v = (GLint)h; return;   // TEXTURE_HEIGHT
+        case 0x8071: *v = t->target == GL_TEXTURE_3D || t->target == GL_TEXTURE_2D_ARRAY ? (GLint)umax(1, t->target == GL_TEXTURE_3D ? t->d >> level : t->d) : 1; return;   // TEXTURE_DEPTH
+        case 0x86a1: *v = g_fmt[t->fmt].kind == K_BLOCK; return;   // TEXTURE_COMPRESSED
+        case 0x86a0: *v = g_fmt[t->fmt].kind == K_BLOCK ? (GLint)(fmt_pitch(t->fmt, w) * fmt_rows(t->fmt, h)) : 0; return;   // TEXTURE_COMPRESSED_IMAGE_SIZE
+    }
+    RED1("glGetTexLevelParameteriv(%#x) not implemented", pn);
 }
 GL(glReadPixels, void, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void *data) {
     readpix_args a = {x, y, w, h, format, type, data}; ((void (*)(const readpix_args *))(const void *)readpix_impl_bs)(&a);
@@ -1726,10 +2174,16 @@ GL(glAttachShader, void, GLuint pr, GLuint sh) {
     prog_t *p = prog_of(pr); shader_t *s = shader_of(sh); if (!p || !s) return;
     if (s->type == GL_VERTEX_SHADER) p->vs = sh; else p->fs = sh;
 }
+GL(glDetachShader, void, GLuint pr, GLuint sh) {   // a linked program keeps its functions (prog_t.fn)
+    prog_t *p = prog_of(pr); if (!p) return;
+    if (p->vs == sh) p->vs = 0;
+    if (p->fs == sh) p->fs = 0;
+}
 static void prog_clear(prog_t *p) {
     for (int i = 0; i < p->npc; i++) if (p->pc[i].pso) CFRelease(p->pc[i].pso);
     free(p->pc); p->pc = NULL; p->npc = p->cappc = 0;
     free(p->u); p->u = NULL; p->nu = 0; free(p->ub[0]); free(p->ub[1]); p->ub[0] = p->ub[1] = NULL; p->fn[0] = p->fn[1] = nil; p->linked = 0;
+    free(p->b); p->b = NULL; p->nb = 0;
 }
 // Uniforms are merged by name over both stages, as GL links them; a location is uniform index × 4096 + array element
 GLB(glLinkProgram, void, GLuint pr) {
@@ -1751,6 +2205,14 @@ GLB(glLinkProgram, void, GLuint pr) {
             if (i < si->nu) { const shuni *m = &si->u[i]; u->type = m->type; u->count = m->count; u->off[st] = m->off; u->stride[st] = m->stride; }
             else { const shsamp *m = &si->t[i - si->nu]; u->type = m->type; u->slot[st] = m->slot; }
         }
+    }
+    // named uniform blocks, merged by name (a block both stages declare is one block of the program); every binding starts at 0, as after a link in GL
+    p->b = zalloc((vs->si->nb + fs->si->nb + 1) * sizeof *p->b);
+    for (int st = 0; st < 2; st++) for (int i = 0; i < p->si[st]->nb; i++) {
+        const shblk *m = &p->si[st]->b[i]; pblk_t *k = NULL;
+        for (int j = 0; j < p->nb; j++) if (!strcmp(p->b[j].name, m->name)) k = &p->b[j];
+        if (!k) { k = &p->b[p->nb++]; strlcpy(k->name, m->name, sizeof k->name); k->slot[0] = k->slot[1] = -1; }
+        k->slot[st] = m->slot; k->size = umax(k->size, m->size);
     }
     // the game's attribute indices: glBindAttribLocation's for the inputs it names, the input's own number for the others (or the lowest index no binding took)
     const shinfo *vi = p->si[0]; uint32_t taken = 0;
@@ -1782,9 +2244,39 @@ GL(glGetProgramiv, void, GLuint pr, GLenum p, GLint *v) {
         case GL_ACTIVE_UNIFORM_MAX_LENGTH: { int m = 0; for (int i = 0; i < x->nu; i++) m = (int)umax(m, (uint32_t)strlen(x->u[i].name) + 4); *v = m; return; }
         case GL_ATTACHED_SHADERS: *v = (x->vs != 0) + (x->fs != 0); return;
         case GL_ACTIVE_ATTRIBUTES: *v = x->si[0] ? x->si[0]->na : 0; return;
+        case 0x8a36: *v = x->nb; return;   // ACTIVE_UNIFORM_BLOCKS
+        case 0x8a35: { int m = 0; for (int i = 0; i < x->nb; i++) m = (int)umax(m, (uint32_t)strlen(x->b[i].name) + 1); *v = m; return; }   // ACTIVE_UNIFORM_BLOCK_MAX_NAME_LENGTH
         case GL_DELETE_STATUS: *v = 0; return;
     }
     RED1("glGetProgramiv(%#x) not implemented", p); *v = 0;
+}
+// Named uniform blocks: an index into the program's merged list, and the indexed uniform buffer binding each one reads
+GL(glGetUniformBlockIndex, GLuint, GLuint pr, const GLchar *name) {
+    prog_t *p = prog_of(pr); if (!p || !p->linked || !name) return 0xffffffffu;   // INVALID_INDEX
+    for (int i = 0; i < p->nb; i++) if (!strcmp(p->b[i].name, name)) return (GLuint)i;
+    return 0xffffffffu;
+}
+GL(glUniformBlockBinding, void, GLuint pr, GLuint index, GLuint binding) {
+    prog_t *p = prog_of(pr); if (!p || index >= (GLuint)p->nb) return;
+    if (binding >= NUBO) { RED1("uniform block binding %u over %d", binding, NUBO - 1); return; }
+    p->b[index].binding = binding;
+}
+GL(glGetActiveUniformBlockiv, void, GLuint pr, GLuint index, GLenum pn, GLint *v) {
+    prog_t *p = prog_of(pr); if (!p || index >= (GLuint)p->nb) return;
+    const pblk_t *k = &p->b[index];
+    switch (pn) {
+        case 0x8a3f: *v = (GLint)k->binding; return;   // UNIFORM_BLOCK_BINDING
+        case 0x8a40: *v = (GLint)k->size; return;   // UNIFORM_BLOCK_DATA_SIZE
+        case 0x8a41: *v = (GLint)strlen(k->name) + 1; return;   // UNIFORM_BLOCK_NAME_LENGTH
+        case 0x8a44: *v = k->slot[0] >= 0; return;   // UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER
+        case 0x8a46: *v = k->slot[1] >= 0; return;   // UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER
+    }
+    RED1("glGetActiveUniformBlockiv(%#x) not implemented", pn); *v = 0;
+}
+GL(glGetActiveUniformBlockName, void, GLuint pr, GLuint index, GLsizei size, GLsizei *len, GLchar *name) {
+    prog_t *p = prog_of(pr); const char *nm = p && index < (GLuint)p->nb ? p->b[index].name : "";
+    if (name && size > 0) strlcpy(name, nm, (size_t)size);
+    if (len) *len = name && size > 0 ? (GLsizei)umin((uint32_t)strlen(nm), (uint32_t)size - 1) : 0;
 }
 GL(glDeleteProgram, void, GLuint pr) { prog_t *p = prog_of(pr); if (!p) return; prog_clear(p); free(g_sps[pr]); g_sps[pr] = NULL; if (S.prog == pr) S.prog = 0; }
 GL(glUseProgram, void, GLuint pr) { S.prog = pr; }

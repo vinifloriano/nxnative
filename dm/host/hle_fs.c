@@ -1028,6 +1028,26 @@ HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → close
 
 // ---------- Overloads from newer SDKs (SDK 16: MountRom without a cache, ReadFile without the bytes-read output / with read options, directory entry count) ----------
 HLE_FORCE("_ZN2nn2fs8MountRomEPKc", "fsp-srv; rom → host RomFS directory (overload without the cache arguments)", Result, h_fs_MountRom1, const char *name) { return h_fs_MountRom(name, NULL, 0); }
+// SDK 21 (Factorio): rom of a program index of a multi-program application (fsp-srv OpenDataStorageWithProgramIndex). The host has one program, index 0: the game's own RomFS; any other
+// index answers "target not found", as for a program the application does not have
+HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPmi", "fsp-srv; rom of program index 0 reads the host directory directly, the cache gets only the minimum size", Result, h_fs_QueryRomCacheIdx, size_t *out, int index) {
+    if (index) return RES_TARGET_NOT_FOUND;
+    return h_fs_QueryRomCache(out);
+}
+HLE_FORCE("_ZN2nn2fs8MountRomEPKciPvm", "fsp-srv; rom of program index 0 → host RomFS directory", Result, h_fs_MountRomIdx, const char *name, int index, void *cache, size_t sz) {
+    if (index) { LOG("fs mount rom %s: program index %d does not exist (the host has one program)", name, index); return RES_TARGET_NOT_FOUND; }
+    return h_fs_MountRom(name, cache, sz);
+}
+// A RAM disk (SDK 21, Factorio mounts ramdisk: with a 32 MB request) keeps its files in the buffer the game gives it, empty at every mount. The host keeps them in the host folder
+// <temporary storage>_ramdisk instead, cleared when it is mounted, so the buffer the game allocates only needs the minimum size
+HLE_FORCE("_ZN2nn2fs20GetRamDiskBufferSizeEm", "fsp-srv; RAM disk files live in a host folder, the buffer gets only the minimum size", size_t, h_fs_RamDiskBufSize, size_t size) { (void)size; return 0x1000; }
+HLE_FORCE("_ZN2nn2fs12MountRamDiskEPKcPvm", "fsp-srv; RAM disk → host folder, emptied at mount", Result, h_fs_MountRamDisk, const char *name, void *buf, size_t sz) {
+    (void)buf; (void)sz; char t[1024], b[1100];
+    snprintf(b, sizeof b, "%s_ramdisk", envdir("DM_TEMP", "run/platform/temp", t, sizeof t));
+    if (!access(b, F_OK) && rm_tree(b)) LOG("[RED] fs RAM disk: cannot clear %s left over from last time (errno=%d)", b, errno);
+    return mount(name, b, 0);
+}
+HLE_FORCE("_ZN2nn2fs32EnableDefaultGlobalFileDataCacheEPvm", "fsp-srv global read cache with the default settings; unused by the host", void, h_fs_EnableDefaultGlobalCache, void *buf, size_t sz) { h_fs_EnableGlobalCache(buf, sz); }
 // ReadFile without the bytes-read output: the read must be complete; a short read (past the end of file) is returned as a failure
 HLE_FORCE("_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", "fsp-srv → pread(2), must read in full", Result, h_fs_ReadFileExact, uint64_t h, int64_t off, void *buf, size_t sz) {
     size_t got = 0; Result r = h_fs_ReadFile(&got, h, off, buf, sz);
